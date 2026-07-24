@@ -1,0 +1,12 @@
+#include "resource.h"
+
+IDI_APP ICON "app.ico"
+
+// Subset of PixelifySans-Regular.ttf (kept alongside as the source). Regenerate with:
+//   python -m fontTools.subset PixelifySans-Regular.ttf ^
+//     --unicodes="U+0020-007E,U+00A0-00FF,U+2013-2014" --layout-features="kern" ^
+//     --drop-tables+=STAT --no-glyph-names --name-IDs="1,2,3,4,6,16,17" ^
+//     --output-file=PixelifySans-Regular.subset.ttf
+// Keeps kern (adjustments reach 4px at title size) and the hinting tables; drops
+// only unused glyphs, the frac/locl features, glyph names, and STAT.
+IDR_FONT_PIXELIFY_REGULAR RCDATA "fonts\\PixelifySans-Regular.subset.ttf"
