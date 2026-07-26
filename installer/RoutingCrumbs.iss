@@ -61,20 +61,3 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 [UninstallRun]
 Filename: "schtasks.exe"; Parameters: "/Delete /TN ""RoutingCrumbs"" /F"; Flags: runhidden; RunOnceId: "RemoveAutostartTask"
 
-[Code]
-function InitializeSetup(): Boolean;
-begin
-  if not FileExists(ExpandConstant('{#MyBuildDir}\{#MyAppExeName}')) then
-  begin
-    MsgBox(
-      'Release build not found.' + #13#10 + #13#10 +
-      'Build the app first:' + #13#10 +
-      '  cmake --build build --config Release' + #13#10 + #13#10 +
-      'Expected:' + #13#10 +
-      ExpandConstant('{#MyBuildDir}\{#MyAppExeName}'),
-      mbError, MB_OK);
-    Result := False;
-  end
-  else
-    Result := True;
-end;
