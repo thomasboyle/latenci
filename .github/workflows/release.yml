@@ -30,9 +30,15 @@ jobs:
             $parts = $latest.Split('.')
             $next = '{0}.{1}.{2}' -f $parts[0], $parts[1], ([int]$parts[2] + 1)
           } else {
-            $next = (Select-String -Path installer/RoutingCrumbs.iss -Pattern '#define MyAppVersion "(.*)"').Matches[0].Groups[1].Value
+            $next = (Select-String -Path installer/ci-version.iss -Pattern '#define MyAppVersion "(.*)"').Matches[0].Groups[1].Value
           }
           "version=$next" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Set installer version
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          "#define MyAppVersion `"$version`"" | Set-Content installer/ci-version.iss -Encoding utf8NoBOM
 
       - uses: TheMrMilchmann/setup-msvc-dev@v4
         with:
@@ -42,7 +48,7 @@ jobs:
         run: choco install innosetup -y --no-progress
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DINSTALLER_VERSION=${{ steps.version.outputs.version }}
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Build installer
         run: cmake --build build --target installer

@@ -10,9 +10,7 @@
   #define MyBuildDir "..\build\Release"
 #endif
 
-#ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
-#endif
+#include "ci-version.iss"
 
 #define MyAppName "Routing Crumbs"
 #define MyAppPublisher "Routing Crumbs"

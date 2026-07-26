@@ -82,14 +82,9 @@ find_program(ISCC_EXECUTABLE ISCC
     PATH_SUFFIXES .
 )
 if(ISCC_EXECUTABLE)
-    set(ISCC_VERSION_DEFINE "")
-    if(INSTALLER_VERSION)
-        set(ISCC_VERSION_DEFINE "/DMyAppVersion=${INSTALLER_VERSION}")
-    endif()
     add_custom_target(installer
         COMMAND ${ISCC_EXECUTABLE}
             /DMyBuildDir=$<TARGET_FILE_DIR:RoutingCrumbs>
-            ${ISCC_VERSION_DEFINE}
             ${CMAKE_CURRENT_SOURCE_DIR}/installer/RoutingCrumbs.iss
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         DEPENDS RoutingCrumbs
