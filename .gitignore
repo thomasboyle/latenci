@@ -1,6 +1,7 @@
 /.vs/
 /out/
 /build/
+/dist/
 /cmake-build-*/
 *.user
 *.suo

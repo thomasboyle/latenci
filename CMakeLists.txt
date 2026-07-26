@@ -73,3 +73,25 @@ if(MSVC)
         $<$<CONFIG:Release>:/OPT:REF /OPT:ICF /INCREMENTAL:NO /LTCG /GUARD:CF /CETCOMPAT>
     )
 endif()
+
+# Optional Windows installer (Inno Setup 6 — free: https://jrsoftware.org/isinfo.php)
+find_program(ISCC_EXECUTABLE ISCC
+    HINTS
+        "C:/Program Files (x86)/Inno Setup 6"
+        "C:/Program Files/Inno Setup 6"
+    PATH_SUFFIXES .
+)
+if(ISCC_EXECUTABLE)
+    add_custom_target(installer
+        COMMAND ${ISCC_EXECUTABLE}
+            /DMyBuildDir=$<TARGET_FILE_DIR:RoutingCrumbs>
+            ${CMAKE_CURRENT_SOURCE_DIR}/installer/RoutingCrumbs.iss
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        DEPENDS RoutingCrumbs
+        COMMENT "Building RoutingCrumbs Windows installer..."
+        VERBATIM
+    )
+    message(STATUS "Inno Setup found: run 'cmake --build build --config Release --target installer'")
+else()
+    message(STATUS "Inno Setup not found — install from https://jrsoftware.org/isinfo.php to build the installer")
+endif()

@@ -37,6 +37,31 @@ build\Release\RoutingCrumbs.exe
 
 Or open the generated `build\RoutingCrumbs.sln` / `.slnx` in Visual Studio and build **Release | x64**.
 
+## Installer
+
+The project ships an [Inno Setup](https://jrsoftware.org/isinfo.php) script (free, open source). The installer puts the app in Program Files, adds Start Menu / optional desktop shortcuts, registers an uninstaller, and removes the autostart task on uninstall.
+
+1. Install **Inno Setup 6** from [jrsoftware.org/isinfo.php](https://jrsoftware.org/isinfo.php) (no cost).
+2. Build Release, then the installer target:
+
+```bat
+cmake --build build --config Release --target installer
+```
+
+Output:
+
+```text
+dist\RoutingCrumbs-Setup-1.0.0.exe
+```
+
+Without Inno Setup on PATH, compile the script manually:
+
+```bat
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\RoutingCrumbs.iss
+```
+
+**SmartScreen:** Windows may warn on first download because the installer is not code-signed. Code signing certificates cost money; the installer itself is a standard Inno Setup package with a proper uninstall entry in Settings. Users can verify the source by building from this repository.
+
 ## Run
 
 Launch `RoutingCrumbs.exe`. A tray icon appears in the notification area (UAC elevation is required — see below).
