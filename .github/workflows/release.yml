@@ -47,6 +47,22 @@ jobs:
       - name: Build installer
         run: cmake --build build --target installer
 
+      - name: Verify release artifacts
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $installer = "dist/RoutingCrumbs-Setup-$version.exe"
+          $binary = "build/RoutingCrumbs.exe"
+          if (-not (Test-Path $installer)) {
+            Write-Error "Installer not found: $installer"
+            Get-ChildItem dist -ErrorAction SilentlyContinue
+            exit 1
+          }
+          if (-not (Test-Path $binary)) {
+            Write-Error "Binary not found: $binary"
+            exit 1
+          }
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
@@ -55,4 +71,5 @@ jobs:
           files: |
             dist/RoutingCrumbs-Setup-${{ steps.version.outputs.version }}.exe
             build/RoutingCrumbs.exe
+          fail_on_unmatched_files: true
           generate_release_notes: true

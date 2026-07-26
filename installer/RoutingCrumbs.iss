@@ -10,8 +10,11 @@
   #define MyBuildDir "..\build\Release"
 #endif
 
+#ifndef MyAppVersion
+  #define MyAppVersion "1.0.0"
+#endif
+
 #define MyAppName "Routing Crumbs"
-#define MyAppVersion "1.0.0"
 #define MyAppPublisher "Routing Crumbs"
 #define MyAppExeName "RoutingCrumbs.exe"
 
