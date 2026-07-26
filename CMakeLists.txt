@@ -85,6 +85,7 @@ if(ISCC_EXECUTABLE)
     add_custom_target(installer
         COMMAND ${ISCC_EXECUTABLE}
             /DMyBuildDir=$<TARGET_FILE_DIR:RoutingCrumbs>
+            $<$<BOOL:${INSTALLER_VERSION}>:/DMyAppVersion=${INSTALLER_VERSION}>
             ${CMAKE_CURRENT_SOURCE_DIR}/installer/RoutingCrumbs.iss
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         DEPENDS RoutingCrumbs

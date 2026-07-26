@@ -13,6 +13,26 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version
+        id: version
+        shell: pwsh
+        run: |
+          git fetch --tags --force
+          $parsed = git tag -l 'v*' | ForEach-Object {
+            $t = $_ -replace '^v', ''
+            if ($t -match '^(\d+\.\d+\.\d+)(?:-build\.\d+)?$') { $Matches[1] }
+          } | Where-Object { $_ }
+          if ($parsed) {
+            $latest = $parsed | Sort-Object { [version]$_ } | Select-Object -Last 1
+            $parts = $latest.Split('.')
+            $next = '{0}.{1}.{2}' -f $parts[0], $parts[1], ([int]$parts[2] + 1)
+          } else {
+            $next = (Select-String -Path installer/RoutingCrumbs.iss -Pattern '#define MyAppVersion "(.*)"').Matches[0].Groups[1].Value
+          }
+          "version=$next" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - uses: TheMrMilchmann/setup-msvc-dev@v4
         with:
@@ -22,23 +42,16 @@ jobs:
         run: choco install innosetup -y --no-progress
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DINSTALLER_VERSION=${{ steps.version.outputs.version }}
 
       - name: Build installer
         run: cmake --build build --target installer
 
-      - name: Read version
-        id: version
-        shell: pwsh
-        run: |
-          $version = (Select-String -Path installer/RoutingCrumbs.iss -Pattern '#define MyAppVersion "(.*)"').Matches[0].Groups[1].Value
-          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: v${{ steps.version.outputs.version }}-build.${{ github.run_number }}
-          name: Routing Crumbs v${{ steps.version.outputs.version }} (build ${{ github.run_number }})
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Routing Crumbs v${{ steps.version.outputs.version }}
           files: |
             dist/RoutingCrumbs-Setup-${{ steps.version.outputs.version }}.exe
             build/RoutingCrumbs.exe
