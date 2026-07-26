@@ -14,14 +14,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
 
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
       - name: Build installer
-        run: cmake --build build --config Release --target installer
+        run: cmake --build build --target installer
 
       - name: Read version
         id: version
@@ -37,5 +41,5 @@ jobs:
           name: Routing Crumbs v${{ steps.version.outputs.version }} (build ${{ github.run_number }})
           files: |
             dist/RoutingCrumbs-Setup-${{ steps.version.outputs.version }}.exe
-            build/Release/RoutingCrumbs.exe
+            build/RoutingCrumbs.exe
           generate_release_notes: true
