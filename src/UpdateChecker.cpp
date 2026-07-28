@@ -40,6 +40,78 @@ CRITICAL_SECTION g_cs;
 bool g_csInit = false;
 HWND g_notifyHwnd = nullptr;
 
+// Owns a WinHTTP session/connect/request triple; closes innermost-first.
+struct WinHttpHandles {
+    HINTERNET session = nullptr;
+    HINTERNET connect = nullptr;
+    HINTERNET request = nullptr;
+
+    WinHttpHandles() = default;
+    WinHttpHandles(const WinHttpHandles&) = delete;
+    WinHttpHandles& operator=(const WinHttpHandles&) = delete;
+
+    void CloseRequest() {
+        if (request) {
+            WinHttpCloseHandle(request);
+            request = nullptr;
+        }
+    }
+
+    void CloseConnect() {
+        CloseRequest();
+        if (connect) {
+            WinHttpCloseHandle(connect);
+            connect = nullptr;
+        }
+    }
+
+    void CloseAll() {
+        CloseConnect();
+        if (session) {
+            WinHttpCloseHandle(session);
+            session = nullptr;
+        }
+    }
+
+    ~WinHttpHandles() { CloseAll(); }
+
+    bool OpenHttpsGet(const wchar_t* host, const wchar_t* path) {
+        CloseAll();
+        session = WinHttpOpen(kUserAgent, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!session) {
+            return false;
+        }
+        connect = WinHttpConnect(session, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!connect) {
+            CloseAll();
+            return false;
+        }
+        request = WinHttpOpenRequest(connect, L"GET", path, nullptr, WINHTTP_NO_REFERER,
+                                     WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!request) {
+            CloseAll();
+            return false;
+        }
+        return true;
+    }
+
+    bool ReopenRequest(const wchar_t* host, const wchar_t* path) {
+        CloseConnect();
+        connect = WinHttpConnect(session, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!connect) {
+            return false;
+        }
+        request = WinHttpOpenRequest(connect, L"GET", path, nullptr, WINHTTP_NO_REFERER,
+                                     WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!request) {
+            CloseConnect();
+            return false;
+        }
+        return true;
+    }
+};
+
 void EnsureCs() {
     if (!g_csInit) {
         InitializeCriticalSection(&g_cs);
@@ -263,50 +335,31 @@ bool HttpGetHttps(const wchar_t* host, const wchar_t* path, char** outBody, DWOR
     *outBody = nullptr;
     *outLen = 0;
 
-    HINTERNET session = WinHttpOpen(kUserAgent, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) {
-        return false;
-    }
-    HINTERNET connect = WinHttpConnect(session, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!connect) {
-        WinHttpCloseHandle(session);
-        return false;
-    }
-    HINTERNET request = WinHttpOpenRequest(connect, L"GET", path, nullptr, WINHTTP_NO_REFERER,
-                                           WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (!request) {
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
+    WinHttpHandles http;
+    if (!http.OpenHttpsGet(host, path)) {
         return false;
     }
 
-    WinHttpAddRequestHeaders(request,
+    WinHttpAddRequestHeaders(http.request,
                              L"Accept: application/vnd.github+json\r\n",
                              static_cast<DWORD>(-1),
                              WINHTTP_ADDREQ_FLAG_ADD);
 
-    BOOL ok = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-    if (!ok || !WinHttpReceiveResponse(request, nullptr)) {
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
+    const BOOL ok = WinHttpSendRequest(http.request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                       WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (!ok || !WinHttpReceiveResponse(http.request, nullptr)) {
         return false;
     }
 
     DWORD status = 0;
     DWORD statusSize = sizeof(status);
-    WinHttpQueryHeaders(request,
+    WinHttpQueryHeaders(http.request,
                         WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                         WINHTTP_HEADER_NAME_BY_INDEX,
                         &status,
                         &statusSize,
                         WINHTTP_NO_HEADER_INDEX);
     if (status != 200) {
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
         return false;
     }
 
@@ -316,13 +369,10 @@ bool HttpGetHttps(const wchar_t* host, const wchar_t* path, char** outBody, DWOR
     for (;;) {
         if (g_stop.load()) {
             free(buf);
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
             return false;
         }
         DWORD avail = 0;
-        if (!WinHttpQueryDataAvailable(request, &avail)) {
+        if (!WinHttpQueryDataAvailable(http.request, &avail)) {
             break;
         }
         if (avail == 0) {
@@ -330,9 +380,6 @@ bool HttpGetHttps(const wchar_t* host, const wchar_t* path, char** outBody, DWOR
         }
         if (len + avail + 1 > kMaxHttpBodyBytes) {
             free(buf);
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
             return false;
         }
         if (len + avail + 1 > cap) {
@@ -341,23 +388,17 @@ bool HttpGetHttps(const wchar_t* host, const wchar_t* path, char** outBody, DWOR
             char* grown = static_cast<char*>(realloc(buf, capped));
             if (!grown) {
                 free(buf);
-                WinHttpCloseHandle(request);
-                WinHttpCloseHandle(connect);
-                WinHttpCloseHandle(session);
                 return false;
             }
             buf = grown;
             cap = capped;
         }
         DWORD read = 0;
-        if (!WinHttpReadData(request, buf + len, avail, &read) || read == 0) {
+        if (!WinHttpReadData(http.request, buf + len, avail, &read) || read == 0) {
             break;
         }
         len += read;
     }
-    WinHttpCloseHandle(request);
-    WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
 
     if (!buf || len == 0) {
         free(buf);
@@ -409,21 +450,8 @@ bool DownloadFile(const wchar_t* url, const wchar_t* destPath) {
         return false;
     }
 
-    HINTERNET session = WinHttpOpen(kUserAgent, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) {
-        return false;
-    }
-    HINTERNET connect = WinHttpConnect(session, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!connect) {
-        WinHttpCloseHandle(session);
-        return false;
-    }
-    HINTERNET request = WinHttpOpenRequest(connect, L"GET", path, nullptr, WINHTTP_NO_REFERER,
-                                           WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-    if (!request) {
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
+    WinHttpHandles http;
+    if (!http.OpenHttpsGet(host, path)) {
         return false;
     }
 
@@ -433,22 +461,19 @@ bool DownloadFile(const wchar_t* url, const wchar_t* destPath) {
         DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
         WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
     };
-    disableRedirects(request);
+    disableRedirects(http.request);
 
     bool haveBody = false;
     for (int hop = 0; hop < 5; ++hop) {
-        BOOL ok = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                     WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-        if (!ok || !WinHttpReceiveResponse(request, nullptr)) {
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
+        const BOOL ok = WinHttpSendRequest(http.request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                           WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+        if (!ok || !WinHttpReceiveResponse(http.request, nullptr)) {
             return false;
         }
 
         DWORD status = 0;
         DWORD statusSize = sizeof(status);
-        WinHttpQueryHeaders(request,
+        WinHttpQueryHeaders(http.request,
                             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                             WINHTTP_HEADER_NAME_BY_INDEX,
                             &status,
@@ -460,23 +485,17 @@ bool DownloadFile(const wchar_t* url, const wchar_t* destPath) {
             break;
         }
         if (status != 301 && status != 302 && status != 307 && status != 308) {
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
             return false;
         }
 
         wchar_t location[1024]{};
         DWORD locSize = sizeof(location);
-        if (!WinHttpQueryHeaders(request,
+        if (!WinHttpQueryHeaders(http.request,
                                  WINHTTP_QUERY_LOCATION,
                                  WINHTTP_HEADER_NAME_BY_INDEX,
                                  location,
                                  &locSize,
                                  WINHTTP_NO_HEADER_INDEX)) {
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
             return false;
         }
 
@@ -486,60 +505,29 @@ bool DownloadFile(const wchar_t* url, const wchar_t* destPath) {
         } else if (location[0] == L'/') {
             swprintf_s(nextUrl, L"https://%s%s", host, location);
         } else {
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
             return false;
         }
 
         if (!IsAllowedDownloadUrl(nextUrl)) {
-            WinHttpCloseHandle(request);
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
             return false;
         }
-
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        request = nullptr;
-        connect = nullptr;
 
         if (!CrackUrl(nextUrl, host, 256, path, 1024)) {
-            WinHttpCloseHandle(session);
             return false;
         }
-        connect = WinHttpConnect(session, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
-        if (!connect) {
-            WinHttpCloseHandle(session);
+        if (!http.ReopenRequest(host, path)) {
             return false;
         }
-        request = WinHttpOpenRequest(connect, L"GET", path, nullptr, WINHTTP_NO_REFERER,
-                                     WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-        if (!request) {
-            WinHttpCloseHandle(connect);
-            WinHttpCloseHandle(session);
-            return false;
-        }
-        disableRedirects(request);
+        disableRedirects(http.request);
     }
 
     if (!haveBody) {
-        if (request) {
-            WinHttpCloseHandle(request);
-        }
-        if (connect) {
-            WinHttpCloseHandle(connect);
-        }
-        WinHttpCloseHandle(session);
         return false;
     }
 
-    HANDLE file = CreateFileW(destPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    const HANDLE file = CreateFileW(destPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connect);
-        WinHttpCloseHandle(session);
         return false;
     }
 
@@ -552,7 +540,7 @@ bool DownloadFile(const wchar_t* url, const wchar_t* destPath) {
             break;
         }
         DWORD avail = 0;
-        if (!WinHttpQueryDataAvailable(request, &avail)) {
+        if (!WinHttpQueryDataAvailable(http.request, &avail)) {
             success = false;
             break;
         }
@@ -563,7 +551,7 @@ bool DownloadFile(const wchar_t* url, const wchar_t* destPath) {
             avail = sizeof(scratch);
         }
         DWORD read = 0;
-        if (!WinHttpReadData(request, scratch, avail, &read) || read == 0) {
+        if (!WinHttpReadData(http.request, scratch, avail, &read) || read == 0) {
             break;
         }
         total += read;
@@ -579,9 +567,6 @@ bool DownloadFile(const wchar_t* url, const wchar_t* destPath) {
     }
 
     CloseHandle(file);
-    WinHttpCloseHandle(request);
-    WinHttpCloseHandle(connect);
-    WinHttpCloseHandle(session);
     if (!success) {
         DeleteFileW(destPath);
         return false;

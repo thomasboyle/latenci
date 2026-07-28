@@ -29,10 +29,15 @@ private:
     void ResolveStaticAdapterInfo();
     void PollDynamicStats();
     void ResolvePingAddress();
-    bool PingOnce(double& outMs);
-    void ApplyPingResult(bool ok, double ms);
+    bool PingOnce(double& outMs) const;
     void ResetPingWindow();
     void NotifyIfNeeded(bool connected);
+    // Poll-thread only: (re)establish session byte baseline. Returns true when
+    // totals/rates must be cleared (new adapter LUID or counter rewind).
+    bool EnsureSessionBaseline(NET_LUID luid, ULONG64 inOctets, ULONG64 outOctets);
+    void ResetSessionBaseline(NET_LUID luid, ULONG64 inOctets, ULONG64 outOctets);
+    void JoinWorkerThreads();
+    void ReleaseNativeHandles();
     static void CALLBACK OnIpInterfaceChange(
         PVOID callerContext,
         PMIB_IPINTERFACE_ROW row,

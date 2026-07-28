@@ -19,7 +19,7 @@ bool WriteRegString(HKEY key, const wchar_t* name, const wchar_t* value) {
                           reinterpret_cast<const BYTE*>(value), bytes) == ERROR_SUCCESS;
 }
 
-bool ReadRegString(HKEY key, const wchar_t* name, wchar_t* out, DWORD outChars) {
+bool ReadRegString(HKEY key, const wchar_t* name, wchar_t* out, const DWORD outChars) {
     DWORD type = 0;
     DWORD bytes = outChars * sizeof(wchar_t);
     const LONG r = RegQueryValueExW(key, name, nullptr, &type,
@@ -32,8 +32,8 @@ bool IsValidIpv4(const wchar_t* s) {
     return InetPtonW(AF_INET, s, &addr) == 1;
 }
 
-bool ParseCustomDnsList(const wchar_t* input, wchar_t* normalized, size_t normalizedCount,
-                        ErrorMsg& error) {
+bool ParseCustomDnsList(const wchar_t* input, wchar_t* const normalized,
+                        const size_t normalizedCount, ErrorMsg& error) {
     normalized[0] = L'\0';
     if (!input || !*input) {
         error.Set(L"Enter at least one IPv4 address");

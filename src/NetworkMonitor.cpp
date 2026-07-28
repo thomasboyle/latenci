@@ -21,7 +21,7 @@ struct Guard {
 // First GetAdaptersAddresses call allocates this much; grown on overflow only.
 constexpr ULONG kGaaInitialBytes = 16 * 1024;
 
-void FormatLinkSpeed(ULONG64 bps, wchar_t* out, size_t outCount) {
+void FormatLinkSpeed(const ULONG64 bps, wchar_t* const out, const size_t outCount) {
     if (bps >= 1'000'000'000ull) {
         const double g = static_cast<double>(bps) / 1'000'000'000.0;
         swprintf_s(out, outCount, L"%.0fgbit", g);
@@ -33,7 +33,7 @@ void FormatLinkSpeed(ULONG64 bps, wchar_t* out, size_t outCount) {
     }
 }
 
-void FormatWifiBand(ULONG freqKhz, wchar_t* out, size_t outCount) {
+void FormatWifiBand(const ULONG freqKhz, wchar_t* const out, const size_t outCount) {
     if (freqKhz == 0) {
         wcscpy_s(out, outCount, L"—");
         return;
@@ -48,7 +48,8 @@ void FormatWifiBand(ULONG freqKhz, wchar_t* out, size_t outCount) {
     }
 }
 
-void QueryWifiFrequency(HANDLE wlanClient, const GUID& ifaceGuid, wchar_t* out, size_t outCount) {
+void QueryWifiFrequency(const HANDLE wlanClient, const GUID& ifaceGuid,
+                        wchar_t* const out, const size_t outCount) {
     wcscpy_s(out, outCount, L"—");
     if (!wlanClient) {
         return;
@@ -101,7 +102,7 @@ void QueryWifiFrequency(HANDLE wlanClient, const GUID& ifaceGuid, wchar_t* out, 
     FormatWifiBand(freqKhz, out, outCount);
 }
 
-bool IsEthernetLike(IFTYPE type) {
+constexpr bool IsEthernetLike(const IFTYPE type) {
     return type == IF_TYPE_ETHERNET_CSMACD ||
            type == IF_TYPE_IEEE80211 ||
            type == IF_TYPE_PPP ||
@@ -193,40 +194,14 @@ bool NetworkMonitor::Start(HWND notifyHwnd, UINT notifyMsg) {
         running_ = false;
         SetEvent(stopEvent_);
         SetEvent(pingWakeEvent_);
-        if (pollThread_) {
-            WaitForSingleObject(pollThread_, INFINITE);
-            CloseHandle(pollThread_);
-            pollThread_ = nullptr;
-        }
-        if (pingThread_) {
-            WaitForSingleObject(pingThread_, INFINITE);
-            CloseHandle(pingThread_);
-            pingThread_ = nullptr;
-        }
-        if (changeHandle_) {
-            CancelMibChangeNotify2(changeHandle_);
-            changeHandle_ = nullptr;
-        }
-        if (icmpHandle_ != INVALID_HANDLE_VALUE) {
-            IcmpCloseHandle(icmpHandle_);
-            icmpHandle_ = INVALID_HANDLE_VALUE;
-        }
-        if (wlanHandle_) {
-            WlanCloseHandle(wlanHandle_, nullptr);
-            wlanHandle_ = nullptr;
-        }
+        JoinWorkerThreads();
+        ReleaseNativeHandles();
         return false;
     }
     return true;
 }
 
-void NetworkMonitor::Stop() {
-    if (!running_) {
-        return;
-    }
-    running_ = false;
-    SetEvent(stopEvent_);
-    SetEvent(pingWakeEvent_);
+void NetworkMonitor::JoinWorkerThreads() {
     if (pollThread_) {
         WaitForSingleObject(pollThread_, INFINITE);
         CloseHandle(pollThread_);
@@ -237,6 +212,9 @@ void NetworkMonitor::Stop() {
         CloseHandle(pingThread_);
         pingThread_ = nullptr;
     }
+}
+
+void NetworkMonitor::ReleaseNativeHandles() {
     if (changeHandle_) {
         CancelMibChangeNotify2(changeHandle_);
         changeHandle_ = nullptr;
@@ -249,6 +227,17 @@ void NetworkMonitor::Stop() {
         WlanCloseHandle(wlanHandle_, nullptr);
         wlanHandle_ = nullptr;
     }
+}
+
+void NetworkMonitor::Stop() {
+    if (!running_) {
+        return;
+    }
+    running_ = false;
+    SetEvent(stopEvent_);
+    SetEvent(pingWakeEvent_);
+    JoinWorkerThreads();
+    ReleaseNativeHandles();
 }
 
 void NetworkMonitor::SetLiveUpdates(bool enabled) {
@@ -276,7 +265,7 @@ bool NetworkMonitor::Connected() const {
 void NetworkMonitor::SetPingTarget(const wchar_t* target) {
     Guard guard(&lock_);
     wcsncpy_s(pingTarget_, target, _TRUNCATE);
-    pingAddrValid_ = false;
+    pingAddrValid_.store(false, std::memory_order_release);
 }
 
 void NetworkMonitor::SetSpeedResults(double downloadMbps, double uploadMbps, bool running) {
@@ -306,7 +295,7 @@ void CALLBACK NetworkMonitor::OnIpInterfaceChange(
     }
 }
 
-void NetworkMonitor::NotifyIfNeeded(bool connected) {
+void NetworkMonitor::NotifyIfNeeded(const bool connected) {
     const bool connectedChanged =
         !havePostedConnected_ || connected != lastPostedConnected_;
     if (!connectedChanged && !liveUpdates_.load(std::memory_order_acquire)) {
@@ -368,8 +357,27 @@ void NetworkMonitor::PingThreadMain() {
         double ms = -1.0;
         const bool ok = PingOnce(ms);
         {
+            // Step: roll the loss window and publish RTT under one lock hold.
             Guard guard(&lock_);
-            ApplyPingResult(ok, ms);
+            if (pingCount_ >= kPingWindow) {
+                if (!pingOk_[pingIndex_]) {
+                    --pingFails_;
+                }
+            }
+            pingOk_[pingIndex_] = ok;
+            if (!ok) {
+                ++pingFails_;
+            }
+            pingIndex_ = (pingIndex_ + 1) % kPingWindow;
+            if (pingCount_ < kPingWindow) {
+                ++pingCount_;
+            }
+            dynamic_.packetLossPct = pingCount_ > 0
+                ? (100.0 * pingFails_ / pingCount_)
+                : 0.0;
+            if (ok) {
+                dynamic_.pingMs = ms;
+            }
         }
         const HANDLE waits[2] = {stopEvent_, pingWakeEvent_};
         const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, 1000);
@@ -399,33 +407,32 @@ void NetworkMonitor::ResolvePingAddress() {
             ok = true;
         }
     }
-    {
-        Guard guard(&lock_);
-        pingAddr_ = addr;
-        pingAddrValid_.store(ok, std::memory_order_release);
-    }
+    // Publish address before the release store so PingOnce's acquire sees it.
+    pingAddr_ = addr;
+    pingAddrValid_.store(ok, std::memory_order_release);
 }
 
-void NetworkMonitor::ApplyPingResult(bool ok, double ms) {
-    if (pingCount_ >= kPingWindow) {
-        if (!pingOk_[pingIndex_]) {
-            --pingFails_;
-        }
+void NetworkMonitor::ResetSessionBaseline(const NET_LUID luid,
+                                          const ULONG64 inOctets,
+                                          const ULONG64 outOctets) {
+    baselineIn_ = inOctets;
+    baselineOut_ = outOctets;
+    sessionLuid_ = luid;
+    haveSessionBaseline_ = true;
+}
+
+bool NetworkMonitor::EnsureSessionBaseline(const NET_LUID luid,
+                                           const ULONG64 inOctets,
+                                           const ULONG64 outOctets) {
+    const bool sameSession = haveSessionBaseline_ &&
+        sessionLuid_.Value == luid.Value;
+    const bool countersRewound = sameSession &&
+        (inOctets < baselineIn_ || outOctets < baselineOut_);
+    if (!sameSession || countersRewound) {
+        ResetSessionBaseline(luid, inOctets, outOctets);
+        return true;
     }
-    pingOk_[pingIndex_] = ok;
-    if (!ok) {
-        ++pingFails_;
-    }
-    pingIndex_ = (pingIndex_ + 1) % kPingWindow;
-    if (pingCount_ < kPingWindow) {
-        ++pingCount_;
-    }
-    dynamic_.packetLossPct = pingCount_ > 0
-        ? (100.0 * pingFails_ / pingCount_)
-        : 0.0;
-    if (ok) {
-        dynamic_.pingMs = ms;
-    }
+    return false;
 }
 
 void NetworkMonitor::ResolveStaticAdapterInfo() {
@@ -559,17 +566,9 @@ void NetworkMonitor::ResolveStaticAdapterInfo() {
         lastOutOctets_ = ifRow.OutOctets;
         lastCounterTick_ = GetTickCount64();
         haveCounters_ = true;
-        const bool sameSession = haveSessionBaseline_ &&
-            sessionLuid_.Value == localStatic.luid.Value;
         // Drivers can reset In/OutOctets across sleep or rebind; unsigned
         // subtraction would report ~2^64 bytes until the next baseline.
-        const bool countersRewound = sameSession &&
-            (ifRow.InOctets < baselineIn_ || ifRow.OutOctets < baselineOut_);
-        if (!sameSession || countersRewound) {
-            baselineIn_ = ifRow.InOctets;
-            baselineOut_ = ifRow.OutOctets;
-            sessionLuid_ = localStatic.luid;
-            haveSessionBaseline_ = true;
+        if (EnsureSessionBaseline(localStatic.luid, ifRow.InOctets, ifRow.OutOctets)) {
             localDyn.downloadedBytes = 0;
             localDyn.uploadedBytes = 0;
             localDyn.recvBps = 0.0;
@@ -622,15 +621,7 @@ void NetworkMonitor::PollDynamicStats() {
         lastInOctets_ = row.InOctets;
         lastOutOctets_ = row.OutOctets;
         lastCounterTick_ = now;
-        const bool sameSession = haveSessionBaseline_ &&
-            sessionLuid_.Value == luid.Value;
-        const bool countersRewound = sameSession &&
-            (row.InOctets < baselineIn_ || row.OutOctets < baselineOut_);
-        if (!sameSession || countersRewound) {
-            baselineIn_ = row.InOctets;
-            baselineOut_ = row.OutOctets;
-            sessionLuid_ = luid;
-            haveSessionBaseline_ = true;
+        if (EnsureSessionBaseline(luid, row.InOctets, row.OutOctets)) {
             dynamic_.downloadedBytes = 0;
             dynamic_.uploadedBytes = 0;
             dynamic_.recvBps = 0.0;
@@ -642,10 +633,7 @@ void NetworkMonitor::PollDynamicStats() {
         lastInOctets_ = row.InOctets;
         lastOutOctets_ = row.OutOctets;
         lastCounterTick_ = now;
-        baselineIn_ = row.InOctets;
-        baselineOut_ = row.OutOctets;
-        sessionLuid_ = luid;
-        haveSessionBaseline_ = true;
+        ResetSessionBaseline(luid, row.InOctets, row.OutOctets);
         dynamic_.downloadedBytes = 0;
         dynamic_.uploadedBytes = 0;
         dynamic_.recvBps = 0.0;
@@ -667,17 +655,14 @@ void NetworkMonitor::PollDynamicStats() {
     dynamic_.connected = (row.OperStatus == IfOperStatusUp);
 }
 
-bool NetworkMonitor::PingOnce(double& outMs) {
-    IN_ADDR addr{};
-    HANDLE icmp = INVALID_HANDLE_VALUE;
-    {
-        Guard guard(&lock_);
-        if (!pingAddrValid_.load(std::memory_order_relaxed)) {
-            return false;
-        }
-        addr = pingAddr_;
-        icmp = icmpHandle_;
+bool NetworkMonitor::PingOnce(double& outMs) const {
+    // icmpHandle_ is published before the ping thread starts and closed only
+    // after JoinWorkerThreads; pingAddr_ is published before pingAddrValid_.
+    if (!pingAddrValid_.load(std::memory_order_acquire)) {
+        return false;
     }
+    const IN_ADDR addr = pingAddr_;
+    const HANDLE icmp = icmpHandle_;
     if (icmp == INVALID_HANDLE_VALUE) {
         return false;
     }
@@ -694,7 +679,7 @@ bool NetworkMonitor::PingOnce(double& outMs) {
         replySize,
         1000);
     if (replied > 0) {
-        auto* echo = reinterpret_cast<ICMP_ECHO_REPLY*>(replyBuf);
+        const auto* echo = reinterpret_cast<const ICMP_ECHO_REPLY*>(replyBuf);
         if (echo->Status == IP_SUCCESS) {
             outMs = static_cast<double>(echo->RoundTripTime);
             return true;
