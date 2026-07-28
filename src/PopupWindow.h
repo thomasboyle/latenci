@@ -14,14 +14,23 @@ enum class ShowMode {
     Pinned,
 };
 
+enum class PanelView {
+    Main,
+    Settings,
+};
+
 enum class PopupHit {
     None = 0,
     Close,
+    IconBadge,
     RunSpeedTest,
     DnsDhcp,
     DnsCloudflare,
     DnsGoogle,
     DnsCustom,
+    SettingsStartup,
+    SettingsCheckUpdate,
+    SettingsDownload,
 };
 
 class PopupWindow {
@@ -29,6 +38,8 @@ public:
     using DnsClickHandler = void (*)(DnsProvider);
     using SpeedClickHandler = void (*)();
     using VisibilityHandler = void (*)(bool visible);
+    using StartupToggleHandler = void (*)(bool enable);
+    using SimpleHandler = void (*)();
 
     PopupWindow();
     ~PopupWindow();
@@ -43,10 +54,13 @@ public:
     bool IsVisible() const;
     bool IsPinned() const { return IsVisible() && showMode_ == ShowMode::Pinned; }
     ShowMode Mode() const { return showMode_; }
+    PanelView View() const { return panelView_; }
 
     void ShowNearTray(const POINT& anchorScreen, ShowMode mode);
     void SetPinned();
     void Hide();
+    void OpenSettings();
+    void ShowMain();
 
     // Used by main to decide hover dismiss: true if cursor is over popup client.
     bool ContainsScreenPoint(POINT screenPt) const;
@@ -54,18 +68,22 @@ public:
     void SetSnapshot(const NetworkSnapshot& snap);
     void SetDnsProvider(DnsProvider provider);
     void SetSpeedTestRunning(bool running);
+    void SetAutostartEnabled(bool enabled);
+    void SetUpdateAvailable(bool available, const wchar_t* version);
+    void SetUpdateStatus(const wchar_t* status);
+    void SetUpdateBusy(bool busy);
 
     void SetDnsClickHandler(DnsClickHandler handler) { onDnsClick_ = handler; }
     void SetSpeedClickHandler(SpeedClickHandler handler) { onSpeedClick_ = handler; }
     void SetVisibilityHandler(VisibilityHandler handler) { onVisibility_ = handler; }
+    void SetStartupToggleHandler(StartupToggleHandler handler) { onStartupToggle_ = handler; }
+    void SetCheckUpdateHandler(SimpleHandler handler) { onCheckUpdate_ = handler; }
+    void SetDownloadUpdateHandler(SimpleHandler handler) { onDownloadUpdate_ = handler; }
 
 private:
-    // Everything DrawPanel reads, in already-formatted form. Compared byte-wise
-    // against the last painted copy so unchanged 1 Hz ticks skip the repaint.
-    // Zero-initialised on every rebuild so padding and post-terminator bytes
-    // stay stable for memcmp.
     struct VisualState {
         wchar_t title[128];
+        wchar_t connection[128];
         wchar_t linkSpeed[32];
         wchar_t ping[32];
         wchar_t loss[32];
@@ -77,10 +95,17 @@ private:
         wchar_t uploadMbps[32];
         wchar_t ipAddress[64];
         wchar_t frequency[32];
+        wchar_t updateVersion[32];
+        wchar_t updateStatus[96];
+        wchar_t appVersion[32];
         ShowMode mode;
+        PanelView view;
         DnsProvider dns;
         PopupHit hover;
         bool speedRunning;
+        bool autostart;
+        bool updateAvailable;
+        bool updateBusy;
     };
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -93,6 +118,8 @@ private:
     bool EnsureGrainBrush(ID2D1RenderTarget* rt);
     void Paint();
     void DrawPanel(ID2D1RenderTarget* rt);
+    void DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, float& y);
+    void DrawSettingsBody(ID2D1RenderTarget* rt, const VisualState& v, float& y);
     void Layout();
     PopupHit HitTest(float x, float y) const;
     void ApplyPaperChrome();
@@ -104,7 +131,6 @@ private:
     void ForceRepaint();
     float MeasureText(const wchar_t* text, IDWriteTextFormat* fmt, float maxW) const;
     void RefreshLabelMetrics();
-    // Client pixels -> layout DIPs.
     float ToDips(int clientPixels) const;
 
     IDWriteTextFormat* Format(float size, DWRITE_FONT_WEIGHT weight);
@@ -113,6 +139,7 @@ private:
     HWND hwnd_ = nullptr;
     HWND owner_ = nullptr;
     ShowMode showMode_ = ShowMode::Hover;
+    PanelView panelView_ = PanelView::Main;
     UINT dpi_ = 96;
 
     ID2D1Factory* d2dFactory_ = nullptr;
@@ -125,6 +152,7 @@ private:
     IDWriteTextFormat* fmtValue_ = nullptr;
     IDWriteTextFormat* fmtSection_ = nullptr;
     IDWriteTextFormat* fmtPill_ = nullptr;
+    IDWriteTextFormat* fmtBadge_ = nullptr;
 
     ID2D1SolidColorBrush* brushPanel_ = nullptr;
     ID2D1SolidColorBrush* brushBorder_ = nullptr;
@@ -143,32 +171,42 @@ private:
     ID2D1SolidColorBrush* brushIconFg_ = nullptr;
     ID2D1SolidColorBrush* brushGrain_ = nullptr;
     ID2D1SolidColorBrush* brushLeaf_ = nullptr;
-    // Small wrapped tile instead of a full-panel grain surface.
+    ID2D1SolidColorBrush* brushGold_ = nullptr;
+    ID2D1SolidColorBrush* brushOnGold_ = nullptr;
     ID2D1BitmapBrush* grainBrush_ = nullptr;
 
-    // Measured once per text-format lifetime; inputs are compile-time constants.
     float sectionSpeedTestW_ = 0.0f;
     float sectionDnsW_ = 0.0f;
     bool haveLabelMetrics_ = false;
-    // Link-speed pill width, re-measured only when its label changes.
     wchar_t speedPillMeasuredFor_[32]{};
     float speedPillTextW_ = 0.0f;
 
     NetworkSnapshot snap_{};
     DnsProvider dnsProvider_ = DnsProvider::Dhcp;
     bool speedRunning_ = false;
+    bool autostartEnabled_ = false;
+    bool updateAvailable_ = false;
+    bool updateBusy_ = false;
+    wchar_t updateVersion_[32]{};
+    wchar_t updateStatus_[96]{};
 
     VisualState visual_{};
     VisualState painted_{};
 
-    // Hit targets (client DIPs)
     D2D1_RECT_F closeBtn_{};
+    D2D1_RECT_F iconBtn_{};
     D2D1_RECT_F runBtn_{};
     D2D1_RECT_F dnsBtns_[4]{};
+    D2D1_RECT_F startupBtn_{};
+    D2D1_RECT_F checkUpdateBtn_{};
+    D2D1_RECT_F downloadUpdateBtn_{};
 
     DnsClickHandler onDnsClick_ = nullptr;
     SpeedClickHandler onSpeedClick_ = nullptr;
     VisibilityHandler onVisibility_ = nullptr;
+    StartupToggleHandler onStartupToggle_ = nullptr;
+    SimpleHandler onCheckUpdate_ = nullptr;
+    SimpleHandler onDownloadUpdate_ = nullptr;
 
     PopupHit hoverHit_ = PopupHit::None;
 };

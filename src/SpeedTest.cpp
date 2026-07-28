@@ -270,7 +270,7 @@ void SpeedTest::Worker() {
     }
 
     HINTERNET session = WinHttpOpen(
-        L"RoutingCrumbs/1.0",
+        L"Latenci/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,

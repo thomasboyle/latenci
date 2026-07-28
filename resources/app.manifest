@@ -3,9 +3,9 @@
   <assemblyIdentity
       version="1.0.0.0"
       processorArchitecture="amd64"
-      name="RoutingCrumbs"
+      name="Latenci"
       type="win32"/>
-  <description>Routing Crumbs — live network status tray flyout</description>
+  <description>Latenci — live network status tray flyout</description>
 
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>

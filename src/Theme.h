@@ -38,10 +38,12 @@ constexpr Color kIconBadgeFg     = FromRgb(0x4F, 0x58, 0x38);
 constexpr Color kGrain           = FromRgb(70, 60, 45, 0.30f);
 constexpr Color kHairline        = FromRgb(0xA7, 0xA2, 0x8B, 0.55f);
 constexpr Color kLeaf            = FromRgb(0x5F, 0x6B, 0x45);
+constexpr Color kGold            = FromRgb(0xC9, 0xA2, 0x27);
+constexpr Color kOnGold          = FromRgb(0x2A, 0x32, 0x20);
 
-// Typography — Pixelify Sans (Regular; Bold weight falls back to Regular)
-constexpr wchar_t kFontFamily[]  = L"Pixelify Sans";
-constexpr wchar_t kFontFallback[] = L"Courier New";
+// Typography — Monocraft (Regular / normal only)
+constexpr wchar_t kFontFamily[]  = L"Monocraft";
+constexpr wchar_t kFontFallback[] = L"Consolas";
 constexpr float kTitleSize       = 20.0f;
 constexpr float kBrandSize       = 12.0f;
 constexpr float kLabelSize       = 14.0f;
@@ -52,6 +54,7 @@ constexpr float kPillSize        = 14.0f;
 // Layout pieces
 constexpr float kIconBadgeSize   = 28.0f;
 constexpr float kIconBadgeRadius = 4.0f;
+constexpr float kUpdateDotSize   = 12.0f;
 constexpr float kSpeedPillH      = 26.0f;
 constexpr float kSpeedPillPadX   = 12.0f;
 constexpr float kSegButtonH      = 30.0f;

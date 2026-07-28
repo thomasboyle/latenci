@@ -1,5 +1,6 @@
 #include "PopupWindow.h"
 #include "Fonts.h"
+#include "Version.h"
 
 #include <dwmapi.h>
 #include <windowsx.h>
@@ -10,10 +11,10 @@
 
 namespace {
 
-constexpr wchar_t kPopupClass[] = L"RoutingCrumbsPopup";
+constexpr wchar_t kPopupClass[] = L"LatenciPopup";
 
-constexpr wchar_t kSectionSpeedTest[] = L"1. Speed Test";
-constexpr wchar_t kSectionDns[] = L"2. DNS Provider";
+constexpr wchar_t kSectionSpeedTest[] = L"Speed Test";
+constexpr wchar_t kSectionDns[] = L"DNS Provider";
 
 // Grain is a wrapped tile rather than a full-panel surface; dot count keeps the
 // original 420-dots-per-panel density.
@@ -110,7 +111,7 @@ bool PopupWindow::Create(HINSTANCE instance, HWND owner) {
     hwnd_ = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
         kPopupClass,
-        L"Routing Crumbs",
+        L"Latenci",
         WS_POPUP,
         0, 0,
         static_cast<int>(Theme::kPanelWidth),
@@ -146,6 +147,7 @@ void PopupWindow::Destroy() {
     if (fmtValue_) { fmtValue_->Release(); fmtValue_ = nullptr; }
     if (fmtSection_) { fmtSection_->Release(); fmtSection_ = nullptr; }
     if (fmtPill_) { fmtPill_->Release(); fmtPill_ = nullptr; }
+    if (fmtBadge_) { fmtBadge_->Release(); fmtBadge_ = nullptr; }
     if (dwriteFactory_) { dwriteFactory_->Release(); dwriteFactory_ = nullptr; }
     if (d2dFactory_) { d2dFactory_->Release(); d2dFactory_ = nullptr; }
     if (hwnd_) {
@@ -251,10 +253,23 @@ void PopupWindow::Hide() {
         ShowWindow(hwnd_, SW_HIDE);
     }
     showMode_ = ShowMode::Hover;
+    panelView_ = PanelView::Main;
     hoverHit_ = PopupHit::None;
     if (wasVisible && onVisibility_) {
         onVisibility_(false);
     }
+}
+
+void PopupWindow::OpenSettings() {
+    panelView_ = PanelView::Settings;
+    Layout();
+    RefreshAndInvalidate();
+}
+
+void PopupWindow::ShowMain() {
+    panelView_ = PanelView::Main;
+    Layout();
+    RefreshAndInvalidate();
 }
 
 bool PopupWindow::ContainsScreenPoint(POINT screenPt) const {
@@ -268,7 +283,13 @@ bool PopupWindow::ContainsScreenPoint(POINT screenPt) const {
 
 void PopupWindow::RebuildVisual() {
     VisualState v{};
-    wcsncpy_s(v.title, snap_.adapterName[0] ? snap_.adapterName : L"Ethernet", _TRUNCATE);
+    if (panelView_ == PanelView::Settings) {
+        wcsncpy_s(v.title, L"Settings", _TRUNCATE);
+        wcsncpy_s(v.connection, L"Latenci", _TRUNCATE);
+    } else {
+        wcsncpy_s(v.title, L"Latenci", _TRUNCATE);
+        wcsncpy_s(v.connection, snap_.adapterName[0] ? snap_.adapterName : L"Ethernet", _TRUNCATE);
+    }
     wcsncpy_s(v.linkSpeed, snap_.linkSpeedLabel[0] ? snap_.linkSpeedLabel : L"—", _TRUNCATE);
     FormatPing(snap_.pingMs, v.ping, 32);
     FormatLoss(snap_.packetLossPct, v.loss, 32);
@@ -280,10 +301,17 @@ void PopupWindow::RebuildVisual() {
     FormatMbps(snap_.uploadMbps, v.uploadMbps, 32);
     wcsncpy_s(v.ipAddress, snap_.ipAddress[0] ? snap_.ipAddress : L"—", _TRUNCATE);
     wcsncpy_s(v.frequency, snap_.frequency[0] ? snap_.frequency : L"—", _TRUNCATE);
+    wcsncpy_s(v.updateVersion, updateVersion_, _TRUNCATE);
+    wcsncpy_s(v.updateStatus, updateStatus_, _TRUNCATE);
+    swprintf_s(v.appVersion, L"v%hs", APP_VERSION);
     v.mode = showMode_;
+    v.view = panelView_;
     v.dns = dnsProvider_;
     v.hover = hoverHit_;
     v.speedRunning = speedRunning_;
+    v.autostart = autostartEnabled_;
+    v.updateAvailable = updateAvailable_;
+    v.updateBusy = updateBusy_;
     memcpy(&visual_, &v, sizeof(VisualState));
 }
 
@@ -345,25 +373,81 @@ void PopupWindow::SetSpeedTestRunning(bool running) {
     RefreshAndInvalidate();
 }
 
+void PopupWindow::SetAutostartEnabled(bool enabled) {
+    autostartEnabled_ = enabled;
+    RefreshAndInvalidate();
+}
+
+void PopupWindow::SetUpdateAvailable(bool available, const wchar_t* version) {
+    updateAvailable_ = available;
+    if (version && version[0]) {
+        wcsncpy_s(updateVersion_, version, _TRUNCATE);
+    } else {
+        updateVersion_[0] = L'\0';
+    }
+    RefreshAndInvalidate();
+}
+
+void PopupWindow::SetUpdateStatus(const wchar_t* status) {
+    if (status) {
+        wcsncpy_s(updateStatus_, status, _TRUNCATE);
+    } else {
+        updateStatus_[0] = L'\0';
+    }
+    RefreshAndInvalidate();
+}
+
+void PopupWindow::SetUpdateBusy(bool busy) {
+    updateBusy_ = busy;
+    RefreshAndInvalidate();
+}
+
 void PopupWindow::Layout() {
     const float pad = Theme::kPadding;
     const float w = Theme::kPanelWidth;
+    const float badge = Theme::kIconBadgeSize;
 
-    // Close button top-right (pinned only; rect still computed for hit-test gating)
+    iconBtn_ = D2D1::RectF(pad, pad, pad + badge, pad + badge);
+
     {
         const float cx1 = w - pad;
         const float cx0 = cx1 - Theme::kCloseSize;
-        const float cy0 = pad + (Theme::kIconBadgeSize - Theme::kCloseSize) * 0.5f;
+        const float cy0 = pad + (badge - Theme::kCloseSize) * 0.5f;
         const float cy1 = cy0 + Theme::kCloseSize;
         const float hit = Theme::kCloseHitPad;
         closeBtn_ = D2D1::RectF(cx0 - hit, cy0 - hit, cx1 + hit, cy1 + hit);
     }
 
+    runBtn_ = {};
+    for (int i = 0; i < 4; ++i) {
+        dnsBtns_[i] = {};
+    }
+    startupBtn_ = {};
+    checkUpdateBtn_ = {};
+    downloadUpdateBtn_ = {};
+
     const float contentLeft = pad;
     const float contentRight = w - pad;
     const float contentW = contentRight - contentLeft;
+    float cursor = pad + badge + Theme::kSectionGap;
 
-    float cursor = pad + Theme::kIconBadgeSize + Theme::kSectionGap;
+    if (panelView_ == PanelView::Settings) {
+        // Version row
+        cursor += Theme::kLabelSize + Theme::kRowGap;
+        // Startup toggle
+        startupBtn_ = D2D1::RectF(contentRight - 72.0f, cursor,
+                                  contentRight, cursor + Theme::kSegButtonH);
+        cursor += Theme::kSegButtonH + Theme::kRowGap + 2.0f + Theme::kSectionGap;
+        // Updates section title + status + buttons
+        cursor += Theme::kSectionSize + Theme::kLabelFieldGap + Theme::kRowGap;
+        cursor += Theme::kLabelSize + Theme::kRowGap;
+        checkUpdateBtn_ = D2D1::RectF(contentLeft, cursor,
+                                      contentLeft + 160.0f, cursor + Theme::kRunButtonH);
+        downloadUpdateBtn_ = D2D1::RectF(contentLeft + 172.0f, cursor,
+                                         contentRight, cursor + Theme::kRunButtonH);
+        return;
+    }
+
     cursor += 4 * (Theme::kLabelSize + Theme::kRowGap);
     cursor += 2.0f + Theme::kSectionGap;
     runBtn_ = D2D1::RectF(
@@ -390,6 +474,21 @@ PopupHit PopupWindow::HitTest(float x, float y) const {
     if (showMode_ == ShowMode::Pinned && contains(closeBtn_, x, y)) {
         return PopupHit::Close;
     }
+    if (contains(iconBtn_, x, y)) {
+        return PopupHit::IconBadge;
+    }
+    if (panelView_ == PanelView::Settings) {
+        if (contains(startupBtn_, x, y)) {
+            return PopupHit::SettingsStartup;
+        }
+        if (contains(checkUpdateBtn_, x, y)) {
+            return PopupHit::SettingsCheckUpdate;
+        }
+        if (updateAvailable_ && contains(downloadUpdateBtn_, x, y)) {
+            return PopupHit::SettingsDownload;
+        }
+        return PopupHit::None;
+    }
     if (contains(runBtn_, x, y)) {
         return PopupHit::RunSpeedTest;
     }
@@ -403,11 +502,15 @@ PopupHit PopupWindow::HitTest(float x, float y) const {
 bool PopupWindow::IsInteractiveHit(PopupHit hit) const {
     switch (hit) {
     case PopupHit::Close:
+    case PopupHit::IconBadge:
     case PopupHit::RunSpeedTest:
     case PopupHit::DnsDhcp:
     case PopupHit::DnsCloudflare:
     case PopupHit::DnsGoogle:
     case PopupHit::DnsCustom:
+    case PopupHit::SettingsStartup:
+    case PopupHit::SettingsCheckUpdate:
+    case PopupHit::SettingsDownload:
         return true;
     case PopupHit::None:
         return false;
@@ -501,12 +604,13 @@ bool PopupWindow::EnsureDeviceResources() {
     }
 
     if (!fmtTitle_) {
-        fmtTitle_ = Format(Theme::kTitleSize, DWRITE_FONT_WEIGHT_BOLD);
+        fmtTitle_ = Format(Theme::kTitleSize, DWRITE_FONT_WEIGHT_NORMAL);
         fmtBrand_ = Format(Theme::kBrandSize, DWRITE_FONT_WEIGHT_NORMAL);
-        fmtLabel_ = Format(Theme::kLabelSize, DWRITE_FONT_WEIGHT_BOLD);
+        fmtLabel_ = Format(Theme::kLabelSize, DWRITE_FONT_WEIGHT_NORMAL);
         fmtValue_ = Format(Theme::kValueSize, DWRITE_FONT_WEIGHT_NORMAL);
-        fmtSection_ = Format(Theme::kSectionSize, DWRITE_FONT_WEIGHT_BOLD);
-        fmtPill_ = Format(Theme::kPillSize, DWRITE_FONT_WEIGHT_BOLD);
+        fmtSection_ = Format(Theme::kSectionSize, DWRITE_FONT_WEIGHT_NORMAL);
+        fmtPill_ = Format(Theme::kPillSize, DWRITE_FONT_WEIGHT_NORMAL);
+        fmtBadge_ = Format(10.0f, DWRITE_FONT_WEIGHT_NORMAL);
 
         if (fmtTitle_) fmtTitle_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         if (fmtBrand_) {
@@ -519,6 +623,10 @@ bool PopupWindow::EnsureDeviceResources() {
         if (fmtPill_) {
             fmtPill_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
             fmtPill_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+        if (fmtBadge_) {
+            fmtBadge_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            fmtBadge_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         }
     }
     RefreshLabelMetrics();
@@ -546,6 +654,8 @@ void PopupWindow::ReleaseBrushes() {
     release(brushIconFg_);
     release(brushGrain_);
     release(brushLeaf_);
+    release(brushGold_);
+    release(brushOnGold_);
 }
 
 bool PopupWindow::EnsureBrushes(ID2D1RenderTarget* rt) {
@@ -571,7 +681,9 @@ bool PopupWindow::EnsureBrushes(ID2D1RenderTarget* rt) {
         !make(Theme::kIconBadgeBg, &brushIconBg_) ||
         !make(Theme::kIconBadgeFg, &brushIconFg_) ||
         !make(Theme::kGrain, &brushGrain_) ||
-        !make(Theme::kLeaf, &brushLeaf_)) {
+        !make(Theme::kLeaf, &brushLeaf_) ||
+        !make(Theme::kGold, &brushGold_) ||
+        !make(Theme::kOnGold, &brushOnGold_)) {
         ReleaseBrushes();
         return false;
     }
@@ -690,41 +802,13 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
                       DWRITE_MEASURING_MODE_NATURAL);
     };
 
-    auto drawSectionTitle = [&](const wchar_t* text, float textW, float x, float y, float maxRight) {
-        const float titleH = Theme::kSectionSize + 2.0f;
-        drawText(text, D2D1::RectF(x, y, maxRight, y + titleH), fmtSection_, brushSubtitle_);
-        const float uy = y + Theme::kSectionSize + 1.0f;
-        rt->DrawLine(D2D1::Point2F(x, uy), D2D1::Point2F(x + textW, uy), brushSubtitle_, 1.0f);
-    };
-
-    auto drawChunkyButton = [&](const D2D1_RECT_F& rc, bool primary, bool hot,
-                                const wchar_t* label) {
-        const float rad = Theme::kControlRadius;
-        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rc, rad, rad);
-        ID2D1SolidColorBrush* fill = primary
-            ? (hot ? brushAccentHover_ : brushStippleBtn_)
-            : brushSurface_;
-        ID2D1SolidColorBrush* edge = primary ? brushInk_ : brushSurfaceBorder_;
-        const float bottomW = primary ? Theme::kBtnBorderBottom
-                                      : (hot ? Theme::kBtnBorderBottom : Theme::kSecondaryBottom);
-
-        rt->FillRoundedRectangle(rr, fill);
-        rt->DrawRoundedRectangle(rr, edge, Theme::kBtnBorderSide);
-        // Heavier bottom border for tactile press feel
-        rt->DrawLine(
-            D2D1::Point2F(rc.left + rad, rc.bottom - 0.5f),
-            D2D1::Point2F(rc.right - rad, rc.bottom - 0.5f),
-            edge, bottomW);
-        drawText(label, rc, fmtPill_, brushInk_);
-    };
-
     // --- Header ---
     const float badge = Theme::kIconBadgeSize;
-    const D2D1_ROUNDED_RECT badgeRc = D2D1::RoundedRect(
-        D2D1::RectF(pad, pad, pad + badge, pad + badge),
-        Theme::kIconBadgeRadius, Theme::kIconBadgeRadius);
-    rt->FillRoundedRectangle(badgeRc, brushIconBg_);
-    rt->DrawRoundedRectangle(badgeRc, brushIconFg_, 1.0f);
+    iconBtn_ = D2D1::RectF(pad, pad, pad + badge, pad + badge);
+    const bool iconHot = (v.hover == PopupHit::IconBadge);
+    const D2D1_ROUNDED_RECT badgeRc = D2D1::RoundedRect(iconBtn_, Theme::kIconBadgeRadius, Theme::kIconBadgeRadius);
+    rt->FillRoundedRectangle(badgeRc, iconHot ? brushAccentHover_ : brushIconBg_);
+    rt->DrawRoundedRectangle(badgeRc, brushIconFg_, iconHot ? 1.5f : 1.0f);
 
     // Soft pixel ethernet glyph (blocky silhouette)
     {
@@ -733,7 +817,6 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
         auto px = [&](float x, float y, float s = 2.0f) {
             rt->FillRectangle(D2D1::RectF(bx + x, by + y, bx + x + s, by + y + s), brushIconFg_);
         };
-        // Outer port frame
         for (int x = 0; x <= 7; ++x) {
             px(static_cast<float>(x) * 2.0f, 0.0f);
             px(static_cast<float>(x) * 2.0f, 10.0f);
@@ -742,16 +825,26 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
             px(0.0f, static_cast<float>(y) * 2.0f);
             px(14.0f, static_cast<float>(y) * 2.0f);
         }
-        // Pins
         px(4.0f, 12.0f);
         px(6.0f, 12.0f);
         px(8.0f, 12.0f);
         px(10.0f, 12.0f);
-        // Dither shade
         if (brushLeaf_) {
             rt->FillRectangle(D2D1::RectF(bx + 4.0f, by + 4.0f, bx + 6.0f, by + 6.0f), brushLeaf_);
             rt->FillRectangle(D2D1::RectF(bx + 8.0f, by + 6.0f, bx + 10.0f, by + 8.0f), brushLeaf_);
         }
+    }
+
+    // Golden "i" update badge on the icon's top-left corner.
+    if (v.updateAvailable && brushGold_ && brushOnGold_ && fmtBadge_) {
+        const float dot = Theme::kUpdateDotSize;
+        const float dx0 = pad - 3.0f;
+        const float dy0 = pad - 3.0f;
+        const D2D1_ELLIPSE el = D2D1::Ellipse(D2D1::Point2F(dx0 + dot * 0.5f, dy0 + dot * 0.5f),
+                                              dot * 0.5f, dot * 0.5f);
+        rt->FillEllipse(el, brushGold_);
+        rt->DrawEllipse(el, brushInk_, 1.0f);
+        drawText(L"i", D2D1::RectF(dx0, dy0 - 0.5f, dx0 + dot, dy0 + dot), fmtBadge_, brushOnGold_);
     }
 
     const float titleRightPad = (v.mode == ShowMode::Pinned)
@@ -760,11 +853,10 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
     drawText(v.title,
              D2D1::RectF(pad + badge + 10.0f, pad - 1.0f, w - pad - titleRightPad, pad + 22.0f),
              fmtTitle_, brushInk_);
-    drawText(L"Routing Crumbs",
+    drawText(v.connection,
              D2D1::RectF(pad + badge + 10.0f, pad + 20.0f, w - pad - titleRightPad, pad + 36.0f),
              fmtBrand_, brushDim_);
 
-    // Close button (pinned)
     float speedPillRight = w - pad;
     if (v.mode == ShowMode::Pinned) {
         const float cx1 = w - pad;
@@ -789,8 +881,26 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
         speedPillRight = cx0 - 10.0f;
     }
 
-    // Link speed chip (secondary chunky control)
-    {
+    if (v.view == PanelView::Main) {
+        auto drawChunkyButton = [&](const D2D1_RECT_F& rc, bool primary, bool hot,
+                                    const wchar_t* label) {
+            const float rad = Theme::kControlRadius;
+            D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rc, rad, rad);
+            ID2D1SolidColorBrush* fill = primary
+                ? (hot ? brushAccentHover_ : brushStippleBtn_)
+                : brushSurface_;
+            ID2D1SolidColorBrush* edge = primary ? brushInk_ : brushSurfaceBorder_;
+            const float bottomW = primary ? Theme::kBtnBorderBottom
+                                          : (hot ? Theme::kBtnBorderBottom : Theme::kSecondaryBottom);
+            rt->FillRoundedRectangle(rr, fill);
+            rt->DrawRoundedRectangle(rr, edge, Theme::kBtnBorderSide);
+            rt->DrawLine(
+                D2D1::Point2F(rc.left + rad, rc.bottom - 0.5f),
+                D2D1::Point2F(rc.right - rad, rc.bottom - 0.5f),
+                edge, bottomW);
+            drawText(label, rc, fmtPill_, brushInk_);
+        };
+
         if (wcscmp(speedPillMeasuredFor_, v.linkSpeed) != 0) {
             speedPillTextW_ = MeasureText(v.linkSpeed, fmtPill_, 200.0f);
             wcsncpy_s(speedPillMeasuredFor_, v.linkSpeed, _TRUNCATE);
@@ -805,19 +915,80 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
     }
 
     float y = pad + badge + Theme::kSectionGap;
+    if (v.view == PanelView::Settings) {
+        DrawSettingsBody(rt, v, y);
+    } else {
+        DrawMainBody(rt, v, y);
+    }
+
+    if (brushLeaf_) {
+        const float lx = w - pad - 18.0f;
+        const float ly = h - pad - 16.0f;
+        auto leafPx = [&](float x, float y) {
+            rt->FillRectangle(D2D1::RectF(lx + x, ly + y, lx + x + 2.0f, ly + y + 2.0f), brushLeaf_);
+        };
+        leafPx(8.0f, 14.0f);
+        leafPx(8.0f, 12.0f);
+        leafPx(8.0f, 10.0f);
+        leafPx(8.0f, 8.0f);
+        leafPx(4.0f, 6.0f);
+        leafPx(2.0f, 4.0f);
+        leafPx(4.0f, 4.0f);
+        leafPx(6.0f, 6.0f);
+        leafPx(10.0f, 6.0f);
+        leafPx(12.0f, 4.0f);
+        leafPx(14.0f, 4.0f);
+        leafPx(12.0f, 6.0f);
+        leafPx(6.0f, 2.0f);
+        leafPx(10.0f, 2.0f);
+    }
+}
+
+void PopupWindow::DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, float& y) {
+    const float w = Theme::kPanelWidth;
+    const float pad = Theme::kPadding;
+
+    auto drawText = [&](const wchar_t* text, const D2D1_RECT_F& rc,
+                        IDWriteTextFormat* fmt, ID2D1Brush* br) {
+        if (!fmt || !br) return;
+        rt->DrawTextW(text, static_cast<UINT32>(wcslen(text)), fmt, rc, br,
+                      D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                      DWRITE_MEASURING_MODE_NATURAL);
+    };
+    auto drawSectionTitle = [&](const wchar_t* text, float textW, float x, float y0, float maxRight) {
+        const float titleH = Theme::kSectionSize + 2.0f;
+        drawText(text, D2D1::RectF(x, y0, maxRight, y0 + titleH), fmtSection_, brushSubtitle_);
+        const float uy = y0 + Theme::kSectionSize + 1.0f;
+        rt->DrawLine(D2D1::Point2F(x, uy), D2D1::Point2F(x + textW, uy), brushSubtitle_, 1.0f);
+    };
+    auto drawChunkyButton = [&](const D2D1_RECT_F& rc, bool primary, bool hot,
+                                const wchar_t* label) {
+        const float rad = Theme::kControlRadius;
+        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rc, rad, rad);
+        ID2D1SolidColorBrush* fill = primary
+            ? (hot ? brushAccentHover_ : brushStippleBtn_)
+            : brushSurface_;
+        ID2D1SolidColorBrush* edge = primary ? brushInk_ : brushSurfaceBorder_;
+        const float bottomW = primary ? Theme::kBtnBorderBottom
+                                      : (hot ? Theme::kBtnBorderBottom : Theme::kSecondaryBottom);
+        rt->FillRoundedRectangle(rr, fill);
+        rt->DrawRoundedRectangle(rr, edge, Theme::kBtnBorderSide);
+        rt->DrawLine(
+            D2D1::Point2F(rc.left + rad, rc.bottom - 0.5f),
+            D2D1::Point2F(rc.right - rad, rc.bottom - 0.5f),
+            edge, bottomW);
+        drawText(label, rc, fmtPill_, brushInk_);
+    };
 
     auto drawStatPair = [&](const wchar_t* l1, const wchar_t* v1,
                             const wchar_t* l2, const wchar_t* v2) {
         const float mid = pad + (w - 2 * pad) * 0.5f + 6.0f;
         const float colW = (w - 2 * pad) * 0.5f - 8.0f;
         const float rowH = Theme::kLabelSize + 4.0f;
-
         drawText(l1, D2D1::RectF(pad, y, pad + colW * 0.55f, y + rowH), fmtLabel_, brushLabel_);
         drawText(v1, D2D1::RectF(pad + colW * 0.40f, y, pad + colW, y + rowH), fmtValue_, brushInk_);
-
         drawText(l2, D2D1::RectF(mid, y, mid + colW * 0.55f, y + rowH), fmtLabel_, brushLabel_);
         drawText(v2, D2D1::RectF(mid + colW * 0.40f, y, w - pad, y + rowH), fmtValue_, brushInk_);
-
         y += Theme::kLabelSize + Theme::kRowGap;
     };
 
@@ -826,14 +997,11 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
     drawStatPair(L"Downloaded", v.downloaded, L"Uploaded", v.uploaded);
     drawStatPair(L"IP Address", v.ipAddress, L"Frequency", v.frequency);
 
-    // Divider
     y += 2.0f;
     rt->DrawLine(D2D1::Point2F(pad, y), D2D1::Point2F(w - pad, y), brushHair_, 1.0f);
     y += Theme::kSectionGap;
 
-    // 1. Speed Test
     drawSectionTitle(kSectionSpeedTest, sectionSpeedTestW_, pad, y + 6.0f, w * 0.55f);
-
     runBtn_ = D2D1::RectF(w - pad - Theme::kRunButtonW, y,
                           w - pad, y + Theme::kRunButtonH);
     {
@@ -858,7 +1026,6 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
     rt->DrawLine(D2D1::Point2F(pad, y), D2D1::Point2F(w - pad, y), brushHair_, 1.0f);
     y += Theme::kSectionGap;
 
-    // 2. DNS Provider
     drawSectionTitle(kSectionDns, sectionDnsW_, pad, y, w - pad);
     y += Theme::kSectionSize + Theme::kLabelFieldGap + Theme::kRowGap;
 
@@ -868,58 +1035,115 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
     const float contentW = w - 2 * pad;
     const float segW = contentW / 4.0f;
 
-    // Flat segmented control with shared olive outline
-    {
-        D2D1_RECT_F group = D2D1::RectF(pad, y, w - pad, y + Theme::kSegButtonH);
-        rt->FillRectangle(group, brushSurface_);
-        rt->DrawRectangle(group, brushSurfaceBorder_, 1.0f);
+    D2D1_RECT_F group = D2D1::RectF(pad, y, w - pad, y + Theme::kSegButtonH);
+    rt->FillRectangle(group, brushSurface_);
+    rt->DrawRectangle(group, brushSurfaceBorder_, 1.0f);
 
-        for (int i = 0; i < 4; ++i) {
-            const float x0 = pad + i * segW;
-            dnsBtns_[i] = D2D1::RectF(x0, y, x0 + segW, y + Theme::kSegButtonH);
-            const bool selected = (v.dns == dnsValues[i]);
-            const bool hot = (v.hover == static_cast<PopupHit>(
-                static_cast<int>(PopupHit::DnsDhcp) + i));
+    for (int i = 0; i < 4; ++i) {
+        const float x0 = pad + i * segW;
+        dnsBtns_[i] = D2D1::RectF(x0, y, x0 + segW, y + Theme::kSegButtonH);
+        const bool selected = (v.dns == dnsValues[i]);
+        const bool hot = (v.hover == static_cast<PopupHit>(
+            static_cast<int>(PopupHit::DnsDhcp) + i));
 
-            if (selected) {
-                rt->FillRectangle(dnsBtns_[i], brushStipple_);
-                rt->DrawRectangle(dnsBtns_[i], brushInk_, 1.0f);
-            } else if (hot) {
-                rt->FillRectangle(dnsBtns_[i], brushStipple_);
-            }
-            if (i > 0) {
-                rt->DrawLine(
-                    D2D1::Point2F(x0, y + 3.0f),
-                    D2D1::Point2F(x0, y + Theme::kSegButtonH - 3.0f),
-                    brushHair_, 1.0f);
-            }
-            drawText(dnsLabels[i], dnsBtns_[i], fmtPill_, brushInk_);
+        if (selected) {
+            rt->FillRectangle(dnsBtns_[i], brushStipple_);
+            rt->DrawRectangle(dnsBtns_[i], brushInk_, 1.0f);
+        } else if (hot) {
+            rt->FillRectangle(dnsBtns_[i], brushStipple_);
         }
+        if (i > 0) {
+            rt->DrawLine(
+                D2D1::Point2F(x0, y + 3.0f),
+                D2D1::Point2F(x0, y + Theme::kSegButtonH - 3.0f),
+                brushHair_, 1.0f);
+        }
+        drawText(dnsLabels[i], dnsBtns_[i], fmtPill_, brushInk_);
+    }
+}
+
+void PopupWindow::DrawSettingsBody(ID2D1RenderTarget* rt, const VisualState& v, float& y) {
+    const float w = Theme::kPanelWidth;
+    const float pad = Theme::kPadding;
+
+    auto drawText = [&](const wchar_t* text, const D2D1_RECT_F& rc,
+                        IDWriteTextFormat* fmt, ID2D1Brush* br) {
+        if (!fmt || !br) return;
+        rt->DrawTextW(text, static_cast<UINT32>(wcslen(text)), fmt, rc, br,
+                      D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                      DWRITE_MEASURING_MODE_NATURAL);
+    };
+    auto drawChunkyButton = [&](const D2D1_RECT_F& rc, bool primary, bool hot,
+                                const wchar_t* label) {
+        const float rad = Theme::kControlRadius;
+        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rc, rad, rad);
+        ID2D1SolidColorBrush* fill = primary
+            ? (hot ? brushAccentHover_ : brushStippleBtn_)
+            : brushSurface_;
+        ID2D1SolidColorBrush* edge = primary ? brushInk_ : brushSurfaceBorder_;
+        const float bottomW = primary ? Theme::kBtnBorderBottom
+                                      : (hot ? Theme::kBtnBorderBottom : Theme::kSecondaryBottom);
+        rt->FillRoundedRectangle(rr, fill);
+        rt->DrawRoundedRectangle(rr, edge, Theme::kBtnBorderSide);
+        rt->DrawLine(
+            D2D1::Point2F(rc.left + rad, rc.bottom - 0.5f),
+            D2D1::Point2F(rc.right - rad, rc.bottom - 0.5f),
+            edge, bottomW);
+        drawText(label, rc, fmtPill_, brushInk_);
+    };
+
+    const float rowH = Theme::kLabelSize + 4.0f;
+    drawText(L"Version", D2D1::RectF(pad, y, pad + 120.0f, y + rowH), fmtLabel_, brushLabel_);
+    drawText(v.appVersion, D2D1::RectF(pad + 120.0f, y, w - pad, y + rowH), fmtValue_, brushInk_);
+    y += Theme::kLabelSize + Theme::kRowGap;
+
+    drawText(L"Launch at startup", D2D1::RectF(pad, y + 6.0f, w - pad - 84.0f, y + 6.0f + rowH),
+             fmtLabel_, brushLabel_);
+    startupBtn_ = D2D1::RectF(w - pad - 72.0f, y, w - pad, y + Theme::kSegButtonH);
+    {
+        const bool hot = (v.hover == PopupHit::SettingsStartup);
+        drawChunkyButton(startupBtn_, v.autostart, hot, v.autostart ? L"On" : L"Off");
+    }
+    y += Theme::kSegButtonH + Theme::kRowGap;
+
+    y += 2.0f;
+    rt->DrawLine(D2D1::Point2F(pad, y), D2D1::Point2F(w - pad, y), brushHair_, 1.0f);
+    y += Theme::kSectionGap;
+
+    const float updatesTitleW = MeasureText(L"Updates", fmtSection_, w - 2 * pad);
+    drawText(L"Updates", D2D1::RectF(pad, y, w - pad, y + Theme::kSectionSize + 2.0f),
+             fmtSection_, brushSubtitle_);
+    rt->DrawLine(D2D1::Point2F(pad, y + Theme::kSectionSize + 1.0f),
+                 D2D1::Point2F(pad + updatesTitleW, y + Theme::kSectionSize + 1.0f),
+                 brushSubtitle_, 1.0f);
+    y += Theme::kSectionSize + Theme::kLabelFieldGap + Theme::kRowGap;
+
+    const wchar_t* status = v.updateStatus[0] ? v.updateStatus
+        : (v.updateAvailable ? L"Update available" : L"No update check yet");
+    drawText(status, D2D1::RectF(pad, y, w - pad, y + rowH), fmtLabel_, brushDim_);
+    y += Theme::kLabelSize + Theme::kRowGap;
+
+    checkUpdateBtn_ = D2D1::RectF(pad, y, pad + 160.0f, y + Theme::kRunButtonH);
+    {
+        const bool hot = (v.hover == PopupHit::SettingsCheckUpdate);
+        const wchar_t* label = v.updateBusy ? L"..." : L"Check for updates";
+        drawChunkyButton(checkUpdateBtn_, true, hot && !v.updateBusy, label);
     }
 
-    // Decorative leaf sprig (bottom-right)
-    if (brushLeaf_) {
-        const float lx = w - pad - 18.0f;
-        const float ly = h - pad - 16.0f;
-        auto leafPx = [&](float x, float y) {
-            rt->FillRectangle(D2D1::RectF(lx + x, ly + y, lx + x + 2.0f, ly + y + 2.0f), brushLeaf_);
-        };
-        // Stem
-        leafPx(8.0f, 14.0f);
-        leafPx(8.0f, 12.0f);
-        leafPx(8.0f, 10.0f);
-        leafPx(8.0f, 8.0f);
-        // Leaves
-        leafPx(4.0f, 6.0f);
-        leafPx(2.0f, 4.0f);
-        leafPx(4.0f, 4.0f);
-        leafPx(6.0f, 6.0f);
-        leafPx(10.0f, 6.0f);
-        leafPx(12.0f, 4.0f);
-        leafPx(14.0f, 4.0f);
-        leafPx(12.0f, 6.0f);
-        leafPx(6.0f, 2.0f);
-        leafPx(10.0f, 2.0f);
+    if (v.updateAvailable) {
+        downloadUpdateBtn_ = D2D1::RectF(pad + 172.0f, y, w - pad, y + Theme::kRunButtonH);
+        const bool hot = (v.hover == PopupHit::SettingsDownload);
+        wchar_t label[48];
+        if (v.updateBusy) {
+            wcscpy_s(label, L"...");
+        } else if (v.updateVersion[0]) {
+            swprintf_s(label, L"Download v%s", v.updateVersion);
+        } else {
+            wcscpy_s(label, L"Download");
+        }
+        drawChunkyButton(downloadUpdateBtn_, true, hot && !v.updateBusy, label);
+    } else {
+        downloadUpdateBtn_ = {};
     }
 }
 
@@ -1020,6 +1244,13 @@ LRESULT PopupWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         case PopupHit::Close:
             Hide();
             break;
+        case PopupHit::IconBadge:
+            if (panelView_ == PanelView::Settings) {
+                ShowMain();
+            } else {
+                OpenSettings();
+            }
+            break;
         case PopupHit::RunSpeedTest:
             if (onSpeedClick_ && !speedRunning_) {
                 onSpeedClick_();
@@ -1036,6 +1267,21 @@ LRESULT PopupWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         case PopupHit::DnsCustom:
             if (onDnsClick_) onDnsClick_(DnsProvider::Custom);
+            break;
+        case PopupHit::SettingsStartup:
+            if (onStartupToggle_) {
+                onStartupToggle_(!autostartEnabled_);
+            }
+            break;
+        case PopupHit::SettingsCheckUpdate:
+            if (onCheckUpdate_ && !updateBusy_) {
+                onCheckUpdate_();
+            }
+            break;
+        case PopupHit::SettingsDownload:
+            if (onDownloadUpdate_ && updateAvailable_ && !updateBusy_) {
+                onDownloadUpdate_();
+            }
             break;
         case PopupHit::None:
             break;

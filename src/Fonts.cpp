@@ -41,7 +41,7 @@ bool LoadAppFonts(HINSTANCE instance) {
         return true;
     }
 
-    if (!MapResourceBytes(instance, IDR_FONT_PIXELIFY_REGULAR, &g_fontData, &g_fontSize)) {
+    if (!MapResourceBytes(instance, IDR_FONT_MONOCRAFT, &g_fontData, &g_fontSize)) {
         return false;
     }
 

@@ -3,7 +3,7 @@
 #include <dwrite.h>
 #include <windows.h>
 
-// Loads Pixelify Sans (Regular) into a DirectWrite private font collection.
+// Loads Monocraft (Regular) into a DirectWrite private font collection.
 bool LoadAppFonts(HINSTANCE instance);
 void UnloadAppFonts();
 

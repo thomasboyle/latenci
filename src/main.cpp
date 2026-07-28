@@ -4,6 +4,7 @@
 #include "SpeedTest.h"
 #include "DnsManager.h"
 #include "Autostart.h"
+#include "UpdateChecker.h"
 #include "Messages.h"
 #include "Fonts.h"
 #include "resource.h"
@@ -60,9 +61,6 @@ void ShowContextMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, IDM_RUN_SPEED_TEST, L"Run Speed Test");
     AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"Settings");
-    const UINT startupFlags = MF_STRING |
-        (Autostart::IsEnabled() ? MF_CHECKED : MF_UNCHECKED);
-    AppendMenuW(menu, startupFlags, IDM_RUN_AT_STARTUP, L"Run at startup");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
 
@@ -136,6 +134,22 @@ void OpenPopupPinned() {
     g_popup.ShowNearTray(TrayAnchorPoint(), ShowMode::Pinned);
 }
 
+void OpenSettingsPinned() {
+    OpenPopupPinned();
+    g_popup.SetAutostartEnabled(Autostart::IsEnabled());
+    g_popup.OpenSettings();
+}
+
+void SyncUpdateUi() {
+    const auto state = UpdateChecker::GetState();
+    const bool available = UpdateChecker::HasUpdate();
+    const bool busy = state == UpdateChecker::State::Checking
+        || state == UpdateChecker::State::Installing;
+    g_popup.SetUpdateAvailable(available, UpdateChecker::AvailableVersion());
+    g_popup.SetUpdateBusy(busy);
+    g_popup.SetUpdateStatus(UpdateChecker::StatusText());
+}
+
 void OpenPopupHover() {
     if (g_popup.IsPinned()) {
         return;
@@ -173,7 +187,7 @@ bool PromptCustomDns(HWND owner, wchar_t* inout, size_t inoutChars) {
     g_promptBufferChars = inoutChars;
     g_promptAccepted = false;
 
-    const wchar_t* cls = L"RoutingCrumbsDnsPrompt";
+    const wchar_t* cls = L"LatenciDnsPrompt";
     static bool s_registered = false;
     if (!s_registered) {
         WNDCLASSEXW wc{sizeof(wc)};
@@ -258,7 +272,7 @@ bool PromptCustomDns(HWND owner, wchar_t* inout, size_t inoutChars) {
 
 void ApplyDns(DnsProvider provider) {
     if (!g_monitor.HasAdapter()) {
-        MessageBoxW(g_msgHwnd, L"No active adapter found.", L"Routing Crumbs", MB_ICONWARNING);
+        MessageBoxW(g_msgHwnd, L"No active adapter found.", L"Latenci", MB_ICONWARNING);
         return;
     }
 
@@ -381,6 +395,21 @@ LRESULT CALLBACK MessageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     }
 
+    case WM_APP_UPDATE_STATE:
+        SyncUpdateUi();
+        return 0;
+
+    case WM_APP_UPDATE_INSTALL_DONE:
+        UpdateChecker::OnInstallFinished(wParam != 0);
+        SyncUpdateUi();
+        if (wParam) {
+            DestroyWindow(hwnd);
+        } else {
+            MessageBoxW(hwnd, L"Could not download or start the update.",
+                        L"Latenci", MB_ICONWARNING);
+        }
+        return 0;
+
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case IDM_RUN_SPEED_TEST:
@@ -390,24 +419,8 @@ LRESULT CALLBACK MessageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             break;
         case IDM_SETTINGS:
-            MessageBoxW(hwnd,
-                        L"Settings are limited to DNS provider selection in the flyout.\n"
-                        L"Ping target and preferences live under HKCU\\Software\\RoutingCrumbs.",
-                        L"Routing Crumbs",
-                        MB_ICONINFORMATION);
+            OpenSettingsPinned();
             break;
-        case IDM_RUN_AT_STARTUP: {
-            const bool enable = !Autostart::IsEnabled();
-            ErrorMsg error;
-            if (!Autostart::SetEnabled(enable, error)) {
-                MessageBoxW(hwnd,
-                            error.Empty() ? L"Could not update startup setting."
-                                          : error.text,
-                            L"Routing Crumbs",
-                            MB_ICONWARNING);
-            }
-            break;
-        }
         case IDM_EXIT:
             DestroyWindow(hwnd);
             break;
@@ -424,6 +437,7 @@ LRESULT CALLBACK MessageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         StopHoverWatch();
         g_speed.Cancel();
         g_monitor.Stop();
+        UpdateChecker::Stop();
         g_popup.Destroy();
         g_tray.Destroy();
         UnloadAppFonts();
@@ -457,13 +471,13 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     wc.hInstance = instance;
     wc.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP));
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.lpszClassName = L"RoutingCrumbsMsg";
+    wc.lpszClassName = L"LatenciMsg";
     RegisterClassExW(&wc);
 
     g_msgHwnd = CreateWindowExW(
         0,
-        L"RoutingCrumbsMsg",
-        L"Routing Crumbs",
+        L"LatenciMsg",
+        L"Latenci",
         WS_OVERLAPPED,
         0, 0, 0, 0,
         nullptr,
@@ -475,20 +489,44 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     }
 
     if (!g_tray.Create(instance, g_msgHwnd, WM_APP_TRAY)) {
-        MessageBoxW(nullptr, L"Failed to create tray icon.", L"Routing Crumbs", MB_ICONERROR);
+        MessageBoxW(nullptr, L"Failed to create tray icon.", L"Latenci", MB_ICONERROR);
         return 1;
     }
 
     if (!g_popup.Create(instance, g_msgHwnd)) {
-        MessageBoxW(nullptr, L"Failed to create popup window.", L"Routing Crumbs", MB_ICONERROR);
+        MessageBoxW(nullptr, L"Failed to create popup window.", L"Latenci", MB_ICONERROR);
         return 1;
     }
 
     g_popup.SetDnsProvider(g_config.dnsProvider);
+    g_popup.SetAutostartEnabled(Autostart::IsEnabled());
     g_popup.SetDnsClickHandler([](DnsProvider p) { ApplyDns(p); });
     g_popup.SetSpeedClickHandler([]() { StartSpeedTest(false, false); });
     g_popup.SetVisibilityHandler([](bool visible) {
         g_monitor.SetLiveUpdates(visible);
+        if (visible) {
+            g_popup.SetAutostartEnabled(Autostart::IsEnabled());
+            SyncUpdateUi();
+        }
+    });
+    g_popup.SetStartupToggleHandler([](bool enable) {
+        ErrorMsg error;
+        if (!Autostart::SetEnabled(enable, error)) {
+            MessageBoxW(g_msgHwnd,
+                        error.Empty() ? L"Could not update startup setting."
+                                      : error.text,
+                        L"Latenci",
+                        MB_ICONWARNING);
+        }
+        g_popup.SetAutostartEnabled(Autostart::IsEnabled());
+    });
+    g_popup.SetCheckUpdateHandler([]() {
+        UpdateChecker::StartCheck(g_msgHwnd);
+        SyncUpdateUi();
+    });
+    g_popup.SetDownloadUpdateHandler([]() {
+        UpdateChecker::BeginInstall(g_msgHwnd);
+        SyncUpdateUi();
     });
 
     g_monitor.SetPingTarget(g_config.pingTarget);
@@ -496,6 +534,8 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
 
     // Populate Download/Upload once at launch (background, quiet on failure).
     StartSpeedTest(true, true);
+
+    UpdateChecker::StartCheck(g_msgHwnd);
 
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

@@ -7,7 +7,7 @@
 
 namespace {
 
-constexpr wchar_t kRegPath[] = L"Software\\RoutingCrumbs";
+constexpr wchar_t kRegPath[] = L"Software\\Latenci";
 
 // Four IPv4 literals plus separators; matches AppConfig::customDns capacity.
 constexpr size_t kNameServerChars = 128;

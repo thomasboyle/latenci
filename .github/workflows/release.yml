@@ -39,6 +39,14 @@ jobs:
         run: |
           $version = '${{ steps.version.outputs.version }}'
           "#define MyAppVersion `"$version`"" | Set-Content installer/ci-version.iss -Encoding utf8NoBOM
+          @(
+            '#pragma once'
+            ''
+            '// Bumped by CI on release; keep in sync with installer/ci-version.iss locally.'
+            '#ifndef APP_VERSION'
+            "#define APP_VERSION `"$version`""
+            '#endif'
+          ) | Set-Content src/Version.h -Encoding utf8NoBOM
 
       - uses: TheMrMilchmann/setup-msvc-dev@v4
         with:
@@ -57,8 +65,8 @@ jobs:
         shell: pwsh
         run: |
           $version = '${{ steps.version.outputs.version }}'
-          $installer = "dist/RoutingCrumbs-Setup-$version.exe"
-          $binary = "build/RoutingCrumbs.exe"
+          $installer = "dist/Latenci-Setup-$version.exe"
+          $binary = "build/Latenci.exe"
           if (-not (Test-Path $installer)) {
             Write-Error "Installer not found: $installer"
             Get-ChildItem dist -ErrorAction SilentlyContinue
@@ -73,9 +81,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ steps.version.outputs.version }}
-          name: Routing Crumbs v${{ steps.version.outputs.version }}
+          name: Latenci v${{ steps.version.outputs.version }}
           files: |
-            dist/RoutingCrumbs-Setup-${{ steps.version.outputs.version }}.exe
-            build/RoutingCrumbs.exe
+            dist/Latenci-Setup-${{ steps.version.outputs.version }}.exe
+            build/Latenci.exe
           fail_on_unmatched_files: true
           generate_release_notes: true

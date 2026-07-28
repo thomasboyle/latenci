@@ -92,7 +92,7 @@ bool TrayIcon::Create(HINSTANCE /*instance*/, HWND messageHwnd, UINT callbackMsg
     nid_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     nid_.uCallbackMessage = callbackMsg;
     nid_.hIcon = iconConnected_;
-    wcscpy_s(nid_.szTip, L"Routing Crumbs");
+    wcscpy_s(nid_.szTip, L"Latenci");
 
     if (!Shell_NotifyIconW(NIM_ADD, &nid_)) {
         return false;
@@ -142,7 +142,7 @@ void TrayIcon::UpdateIcon() {
     }
     nid_.hIcon = connected_ ? iconConnected_ : iconDisconnected_;
     nid_.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
-    wcscpy_s(nid_.szTip, connected_ ? L"Routing Crumbs — Connected" : L"Routing Crumbs — No connection");
+    wcscpy_s(nid_.szTip, connected_ ? L"Latenci — Connected" : L"Latenci — No connection");
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
     nid_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
 }
