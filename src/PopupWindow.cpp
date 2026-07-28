@@ -442,8 +442,8 @@ void PopupWindow::Layout() {
         cursor += Theme::kSectionSize + Theme::kLabelFieldGap + Theme::kRowGap;
         cursor += Theme::kLabelSize + Theme::kRowGap;
         checkUpdateBtn_ = D2D1::RectF(contentLeft, cursor,
-                                      contentLeft + 160.0f, cursor + Theme::kRunButtonH);
-        downloadUpdateBtn_ = D2D1::RectF(contentLeft + 172.0f, cursor,
+                                      contentLeft + 200.0f, cursor + Theme::kRunButtonH);
+        downloadUpdateBtn_ = D2D1::RectF(contentLeft + 212.0f, cursor,
                                          contentRight, cursor + Theme::kRunButtonH);
         return;
     }
@@ -985,10 +985,21 @@ void PopupWindow::DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, floa
         const float mid = pad + (w - 2 * pad) * 0.5f + 6.0f;
         const float colW = (w - 2 * pad) * 0.5f - 8.0f;
         const float rowH = Theme::kLabelSize + 4.0f;
-        drawText(l1, D2D1::RectF(pad, y, pad + colW * 0.55f, y + rowH), fmtLabel_, brushLabel_);
-        drawText(v1, D2D1::RectF(pad + colW * 0.40f, y, pad + colW, y + rowH), fmtValue_, brushInk_);
-        drawText(l2, D2D1::RectF(mid, y, mid + colW * 0.55f, y + rowH), fmtLabel_, brushLabel_);
-        drawText(v2, D2D1::RectF(mid + colW * 0.40f, y, w - pad, y + rowH), fmtValue_, brushInk_);
+        const float gap = Theme::kLabelFieldGap + 2.0f;
+
+        auto drawCol = [&](float x0, float x1, const wchar_t* label, const wchar_t* value) {
+            float labelW = MeasureText(label, fmtLabel_, colW);
+            // Keep value column usable even for long labels (e.g. "IP Address").
+            const float maxLabelW = colW * 0.58f;
+            if (labelW > maxLabelW) {
+                labelW = maxLabelW;
+            }
+            const float split = x0 + labelW + gap;
+            drawText(label, D2D1::RectF(x0, y, split, y + rowH), fmtLabel_, brushLabel_);
+            drawText(value, D2D1::RectF(split, y, x1, y + rowH), fmtValue_, brushInk_);
+        };
+        drawCol(pad, pad + colW, l1, v1);
+        drawCol(mid, w - pad, l2, v2);
         y += Theme::kLabelSize + Theme::kRowGap;
     };
 
@@ -1015,10 +1026,20 @@ void PopupWindow::DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, floa
         const float mid = pad + (w - 2 * pad) * 0.5f + 6.0f;
         const float colW = (w - 2 * pad) * 0.5f - 8.0f;
         const float rowH = Theme::kLabelSize + 4.0f;
-        drawText(L"Download", D2D1::RectF(pad, y, pad + colW * 0.55f, y + rowH), fmtLabel_, brushLabel_);
-        drawText(v.downloadMbps, D2D1::RectF(pad + colW * 0.40f, y, pad + colW, y + rowH), fmtValue_, brushInk_);
-        drawText(L"Upload", D2D1::RectF(mid, y, mid + colW * 0.55f, y + rowH), fmtLabel_, brushLabel_);
-        drawText(v.uploadMbps, D2D1::RectF(mid + colW * 0.40f, y, w - pad, y + rowH), fmtValue_, brushInk_);
+        const float gap = Theme::kLabelFieldGap + 2.0f;
+
+        auto drawCol = [&](float x0, float x1, const wchar_t* label, const wchar_t* value) {
+            float labelW = MeasureText(label, fmtLabel_, colW);
+            const float maxLabelW = colW * 0.58f;
+            if (labelW > maxLabelW) {
+                labelW = maxLabelW;
+            }
+            const float split = x0 + labelW + gap;
+            drawText(label, D2D1::RectF(x0, y, split, y + rowH), fmtLabel_, brushLabel_);
+            drawText(value, D2D1::RectF(split, y, x1, y + rowH), fmtValue_, brushInk_);
+        };
+        drawCol(pad, pad + colW, L"Download", v.downloadMbps);
+        drawCol(mid, w - pad, L"Upload", v.uploadMbps);
         y += Theme::kLabelSize + Theme::kRowGap;
     }
 
@@ -1123,15 +1144,23 @@ void PopupWindow::DrawSettingsBody(ID2D1RenderTarget* rt, const VisualState& v, 
     drawText(status, D2D1::RectF(pad, y, w - pad, y + rowH), fmtLabel_, brushDim_);
     y += Theme::kLabelSize + Theme::kRowGap;
 
-    checkUpdateBtn_ = D2D1::RectF(pad, y, pad + 160.0f, y + Theme::kRunButtonH);
+    const wchar_t* checkLabel = v.updateBusy ? L"..." : L"Check for updates";
+    float checkW = MeasureText(checkLabel, fmtPill_, w - 2 * pad) + 28.0f;
+    if (checkW < 140.0f) {
+        checkW = 140.0f;
+    }
+    const float maxCheckW = v.updateAvailable ? (w - 2 * pad) * 0.55f : (w - 2 * pad);
+    if (checkW > maxCheckW) {
+        checkW = maxCheckW;
+    }
+    checkUpdateBtn_ = D2D1::RectF(pad, y, pad + checkW, y + Theme::kRunButtonH);
     {
         const bool hot = (v.hover == PopupHit::SettingsCheckUpdate);
-        const wchar_t* label = v.updateBusy ? L"..." : L"Check for updates";
-        drawChunkyButton(checkUpdateBtn_, true, hot && !v.updateBusy, label);
+        drawChunkyButton(checkUpdateBtn_, true, hot && !v.updateBusy, checkLabel);
     }
 
     if (v.updateAvailable) {
-        downloadUpdateBtn_ = D2D1::RectF(pad + 172.0f, y, w - pad, y + Theme::kRunButtonH);
+        downloadUpdateBtn_ = D2D1::RectF(pad + checkW + 12.0f, y, w - pad, y + Theme::kRunButtonH);
         const bool hot = (v.hover == PopupHit::SettingsDownload);
         wchar_t label[48];
         if (v.updateBusy) {
