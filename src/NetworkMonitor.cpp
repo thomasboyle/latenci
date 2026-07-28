@@ -189,6 +189,34 @@ bool NetworkMonitor::Start(HWND notifyHwnd, UINT notifyMsg) {
     running_ = true;
     pollThread_ = CreateThread(nullptr, 0, PollThreadEntry, this, 0, nullptr);
     pingThread_ = CreateThread(nullptr, 0, PingThreadEntry, this, 0, nullptr);
+    if (!pollThread_ || !pingThread_) {
+        running_ = false;
+        SetEvent(stopEvent_);
+        SetEvent(pingWakeEvent_);
+        if (pollThread_) {
+            WaitForSingleObject(pollThread_, INFINITE);
+            CloseHandle(pollThread_);
+            pollThread_ = nullptr;
+        }
+        if (pingThread_) {
+            WaitForSingleObject(pingThread_, INFINITE);
+            CloseHandle(pingThread_);
+            pingThread_ = nullptr;
+        }
+        if (changeHandle_) {
+            CancelMibChangeNotify2(changeHandle_);
+            changeHandle_ = nullptr;
+        }
+        if (icmpHandle_ != INVALID_HANDLE_VALUE) {
+            IcmpCloseHandle(icmpHandle_);
+            icmpHandle_ = INVALID_HANDLE_VALUE;
+        }
+        if (wlanHandle_) {
+            WlanCloseHandle(wlanHandle_, nullptr);
+            wlanHandle_ = nullptr;
+        }
+        return false;
+    }
     return true;
 }
 
@@ -533,7 +561,11 @@ void NetworkMonitor::ResolveStaticAdapterInfo() {
         haveCounters_ = true;
         const bool sameSession = haveSessionBaseline_ &&
             sessionLuid_.Value == localStatic.luid.Value;
-        if (!sameSession) {
+        // Drivers can reset In/OutOctets across sleep or rebind; unsigned
+        // subtraction would report ~2^64 bytes until the next baseline.
+        const bool countersRewound = sameSession &&
+            (ifRow.InOctets < baselineIn_ || ifRow.OutOctets < baselineOut_);
+        if (!sameSession || countersRewound) {
             baselineIn_ = ifRow.InOctets;
             baselineOut_ = ifRow.OutOctets;
             sessionLuid_ = localStatic.luid;
@@ -592,15 +624,32 @@ void NetworkMonitor::PollDynamicStats() {
         lastCounterTick_ = now;
         const bool sameSession = haveSessionBaseline_ &&
             sessionLuid_.Value == luid.Value;
-        if (!sameSession) {
+        const bool countersRewound = sameSession &&
+            (row.InOctets < baselineIn_ || row.OutOctets < baselineOut_);
+        if (!sameSession || countersRewound) {
             baselineIn_ = row.InOctets;
             baselineOut_ = row.OutOctets;
             sessionLuid_ = luid;
             haveSessionBaseline_ = true;
             dynamic_.downloadedBytes = 0;
             dynamic_.uploadedBytes = 0;
+            dynamic_.recvBps = 0.0;
+            dynamic_.sendBps = 0.0;
         }
         haveCounters_ = true;
+    } else if (row.InOctets < lastInOctets_ || row.OutOctets < lastOutOctets_ ||
+               row.InOctets < baselineIn_ || row.OutOctets < baselineOut_) {
+        lastInOctets_ = row.InOctets;
+        lastOutOctets_ = row.OutOctets;
+        lastCounterTick_ = now;
+        baselineIn_ = row.InOctets;
+        baselineOut_ = row.OutOctets;
+        sessionLuid_ = luid;
+        haveSessionBaseline_ = true;
+        dynamic_.downloadedBytes = 0;
+        dynamic_.uploadedBytes = 0;
+        dynamic_.recvBps = 0.0;
+        dynamic_.sendBps = 0.0;
     } else {
         const double dt = (now - lastCounterTick_) / 1000.0;
         if (dt > 0.05) {

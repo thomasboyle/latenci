@@ -146,6 +146,9 @@ bool DnsManager::Apply(DnsProvider provider, const GUID& ifaceGuid,
             return false;
         }
         break;
+    default:
+        error.Set(L"Unknown DNS provider");
+        return false;
     }
 
     DNS_INTERFACE_SETTINGS settings{};

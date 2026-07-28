@@ -24,8 +24,10 @@ void Stop();
 
 bool HasUpdate();
 State GetState();
-const wchar_t* AvailableVersion();
-const wchar_t* StatusText();
+
+// Copies under the update lock; never returns a live pointer into shared buffers.
+void CopyAvailableVersion(wchar_t* out, size_t outChars);
+void CopyStatusText(wchar_t* out, size_t outChars);
 
 // Download the installer and run a silent update (background thread).
 void BeginInstall(HWND notifyHwnd);

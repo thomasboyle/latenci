@@ -55,6 +55,7 @@ target_link_libraries(Latenci PRIVATE
     wlanapi
     ws2_32
     winhttp
+    wintrust
     comctl32
     shell32
     ole32

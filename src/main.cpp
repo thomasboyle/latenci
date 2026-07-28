@@ -27,6 +27,7 @@ bool g_hoverPending = false;
 UINT_PTR g_hoverWatchTimer = 0;
 ULONGLONG g_lastTrayClickTick = 0;
 SpeedTest::Result g_lastSpeedResult{};
+SRWLOCK g_speedResultLock = SRWLOCK_INIT;
 bool g_speedTestQuiet = false;
 
 // Shell_NotifyIconGetRect is a cross-process call into the shell. Cache it and
@@ -145,9 +146,13 @@ void SyncUpdateUi() {
     const bool available = UpdateChecker::HasUpdate();
     const bool busy = state == UpdateChecker::State::Checking
         || state == UpdateChecker::State::Installing;
-    g_popup.SetUpdateAvailable(available, UpdateChecker::AvailableVersion());
+    wchar_t version[32]{};
+    wchar_t status[96]{};
+    UpdateChecker::CopyAvailableVersion(version, 32);
+    UpdateChecker::CopyStatusText(status, 96);
+    g_popup.SetUpdateAvailable(available, version);
     g_popup.SetUpdateBusy(busy);
-    g_popup.SetUpdateStatus(UpdateChecker::StatusText());
+    g_popup.SetUpdateStatus(status);
 }
 
 void OpenPopupHover() {
@@ -306,7 +311,9 @@ void StartSpeedTest(bool quick = false, bool quiet = false) {
     g_popup.SetSpeedTestRunning(true);
 
     g_speed.Start(g_msgHwnd, WM_APP_SPEED_DONE, [](const SpeedTest::Result& r) {
+        AcquireSRWLockExclusive(&g_speedResultLock);
         g_lastSpeedResult = r;
+        ReleaseSRWLockExclusive(&g_speedResultLock);
     }, quick);
 }
 
@@ -376,16 +383,20 @@ LRESULT CALLBACK MessageWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_APP_SPEED_DONE: {
+        SpeedTest::Result speedResult{};
+        AcquireSRWLockExclusive(&g_speedResultLock);
+        speedResult = g_lastSpeedResult;
+        ReleaseSRWLockExclusive(&g_speedResultLock);
         if (wParam) {
             g_monitor.SetSpeedResults(
-                g_lastSpeedResult.downloadMbps,
-                g_lastSpeedResult.uploadMbps,
+                speedResult.downloadMbps,
+                speedResult.uploadMbps,
                 false);
         } else {
             const auto snap = g_monitor.GetSnapshot();
             g_monitor.SetSpeedResults(snap.downloadMbps, snap.uploadMbps, false);
-            if (!g_speedTestQuiet && !g_lastSpeedResult.error.Empty()) {
-                MessageBoxW(hwnd, g_lastSpeedResult.error.text,
+            if (!g_speedTestQuiet && !speedResult.error.Empty()) {
+                MessageBoxW(hwnd, speedResult.error.text,
                             L"Speed test failed", MB_ICONWARNING);
             }
         }
@@ -530,7 +541,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
     });
 
     g_monitor.SetPingTarget(g_config.pingTarget);
-    g_monitor.Start(g_msgHwnd, WM_APP_STATS_UPDATED);
+    if (!g_monitor.Start(g_msgHwnd, WM_APP_STATS_UPDATED)) {
+        MessageBoxW(nullptr, L"Failed to start network monitoring.", L"Latenci", MB_ICONERROR);
+        return 1;
+    }
 
     // Populate Download/Upload once at launch (background, quiet on failure).
     StartSpeedTest(true, true);

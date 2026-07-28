@@ -2,6 +2,9 @@
 #include "Version.h"
 
 #include <winhttp.h>
+#include <wintrust.h>
+#include <softpub.h>
+#include <shellapi.h>
 
 #include <atomic>
 #include <cstdlib>
@@ -11,14 +14,19 @@
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "shell32.lib")
-
-#include <shellapi.h>
+#pragma comment(lib, "wintrust.lib")
 
 namespace {
 
 constexpr wchar_t kApiHost[] = L"api.github.com";
 constexpr wchar_t kApiPath[] = L"/repos/thomasboyle/latenci/releases/latest";
 constexpr wchar_t kUserAgent[] = L"Latenci-Updater";
+constexpr wchar_t kRepoPathPrefix[] = L"/thomasboyle/latenci/";
+
+// GitHub release JSON is small; unbounded growth is an easy remote DoS.
+constexpr DWORD kMaxHttpBodyBytes = 2 * 1024 * 1024;
+// Installer payloads are tens of MB; reject absurd Content-Length / streams.
+constexpr ULONGLONG kMaxInstallerBytes = 200ull * 1024ull * 1024ull;
 
 std::atomic<bool> g_stop{false};
 HANDLE g_checkThread = nullptr;
@@ -54,15 +62,49 @@ void SetState(UpdateChecker::State state, const wchar_t* status, HWND notify) {
     }
 }
 
-bool ParseSemver(const char* s, int& major, int& minor, int& patch) {
+bool ParseUint(const char*& s, unsigned& out) {
+    if (!s || *s < '0' || *s > '9') {
+        return false;
+    }
+    unsigned value = 0;
+    while (*s >= '0' && *s <= '9') {
+        const unsigned digit = static_cast<unsigned>(*s - '0');
+        if (value > (UINT_MAX - digit) / 10u) {
+            return false;
+        }
+        value = value * 10u + digit;
+        ++s;
+    }
+    out = value;
+    return true;
+}
+
+bool ParseSemver(const char* s, unsigned& major, unsigned& minor, unsigned& patch) {
     if (!s || !*s) {
         return false;
     }
     if (*s == 'v' || *s == 'V') {
         ++s;
     }
-    int a = 0, b = 0, c = 0;
-    if (sscanf_s(s, "%d.%d.%d", &a, &b, &c) < 2) {
+    unsigned a = 0, b = 0, c = 0;
+    if (!ParseUint(s, a)) {
+        return false;
+    }
+    if (*s != '.') {
+        return false;
+    }
+    ++s;
+    if (!ParseUint(s, b)) {
+        return false;
+    }
+    if (*s == '.') {
+        ++s;
+        if (!ParseUint(s, c)) {
+            return false;
+        }
+    }
+    // Reject trailing junk (pre-release suffixes, garbage).
+    if (*s != '\0') {
         return false;
     }
     major = a;
@@ -72,8 +114,8 @@ bool ParseSemver(const char* s, int& major, int& minor, int& patch) {
 }
 
 int CompareSemver(const char* remote, const char* local) {
-    int rMaj = 0, rMin = 0, rPat = 0;
-    int lMaj = 0, lMin = 0, lPat = 0;
+    unsigned rMaj = 0, rMin = 0, rPat = 0;
+    unsigned lMaj = 0, lMin = 0, lPat = 0;
     if (!ParseSemver(remote, rMaj, rMin, rPat) || !ParseSemver(local, lMaj, lMin, lPat)) {
         return 0;
     }
@@ -118,8 +160,24 @@ bool ExtractJsonString(const char* json, const char* key, char* out, size_t outN
         }
         out[i++] = *p++;
     }
+    if (*p != '"') {
+        out[0] = '\0';
+        return false;
+    }
     out[i] = '\0';
     return i > 0;
+}
+
+bool IsAllowedInstallerName(const char* name) {
+    if (!name || !*name) {
+        return false;
+    }
+    // Inno output: Latenci-Setup-{version}.exe
+    if (_strnicmp(name, "Latenci-Setup-", 14) != 0) {
+        return false;
+    }
+    const size_t n = strlen(name);
+    return n > 18 && _stricmp(name + (n - 4), ".exe") == 0;
 }
 
 bool ExtractInstallerUrl(const char* json, char* out, size_t outN) {
@@ -127,8 +185,6 @@ bool ExtractInstallerUrl(const char* json, char* out, size_t outN) {
         return false;
     }
     const char* cursor = json;
-    char best[512]{};
-    char anyExe[512]{};
     while ((cursor = strstr(cursor, "\"browser_download_url\"")) != nullptr) {
         char url[512]{};
         if (!ExtractJsonString(cursor, "browser_download_url", url, sizeof(url))) {
@@ -137,27 +193,11 @@ bool ExtractInstallerUrl(const char* json, char* out, size_t outN) {
         }
         const char* name = strrchr(url, '/');
         name = name ? name + 1 : url;
-        const bool isExe = strstr(name, ".exe") != nullptr;
-        const bool isSetup = strstr(name, "Setup") != nullptr || strstr(name, "setup") != nullptr;
-        const bool isNaked =
-            _stricmp(name, "Latenci.exe") == 0 ||
-            _stricmp(name, "RoutingCrumbs.exe") == 0;
-        if (isExe && isSetup) {
-            strcpy_s(best, url);
-            break;
-        }
-        if (isExe && !isNaked && anyExe[0] == '\0') {
-            strcpy_s(anyExe, url);
+        if (IsAllowedInstallerName(name)) {
+            strcpy_s(out, outN, url);
+            return true;
         }
         ++cursor;
-    }
-    if (best[0]) {
-        strcpy_s(out, outN, best);
-        return true;
-    }
-    if (anyExe[0]) {
-        strcpy_s(out, outN, anyExe);
-        return true;
     }
     return false;
 }
@@ -167,6 +207,56 @@ bool Utf8ToWide(const char* utf8, wchar_t* out, size_t outChars) {
         return false;
     }
     return MultiByteToWideChar(CP_UTF8, 0, utf8, -1, out, static_cast<int>(outChars)) > 0;
+}
+
+bool CrackUrl(const wchar_t* url, wchar_t* host, size_t hostN, wchar_t* path, size_t pathN) {
+    URL_COMPONENTS uc{};
+    uc.dwStructSize = sizeof(uc);
+    uc.dwHostNameLength = static_cast<DWORD>(-1);
+    uc.dwUrlPathLength = static_cast<DWORD>(-1);
+    uc.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(url, 0, 0, &uc)) {
+        return false;
+    }
+    if (uc.nScheme != INTERNET_SCHEME_HTTPS) {
+        return false;
+    }
+    if (!uc.lpszHostName || uc.dwHostNameLength == 0 || !uc.lpszUrlPath) {
+        return false;
+    }
+    wcsncpy_s(host, hostN, uc.lpszHostName, uc.dwHostNameLength);
+    if (uc.lpszExtraInfo && uc.dwExtraInfoLength > 0) {
+        swprintf_s(path, pathN, L"%.*s%.*s",
+                   static_cast<int>(uc.dwUrlPathLength), uc.lpszUrlPath,
+                   static_cast<int>(uc.dwExtraInfoLength), uc.lpszExtraInfo);
+    } else {
+        wcsncpy_s(path, pathN, uc.lpszUrlPath, uc.dwUrlPathLength);
+    }
+    return true;
+}
+
+bool HostEquals(const wchar_t* host, const wchar_t* expected) {
+    return _wcsicmp(host, expected) == 0;
+}
+
+bool IsAllowedDownloadUrl(const wchar_t* url) {
+    wchar_t host[256]{};
+    wchar_t path[1024]{};
+    if (!CrackUrl(url, host, 256, path, 1024)) {
+        return false;
+    }
+
+    if (HostEquals(host, L"github.com")) {
+        return _wcsnicmp(path, kRepoPathPrefix, wcslen(kRepoPathPrefix)) == 0 &&
+               wcsstr(path, L"/releases/download/") != nullptr;
+    }
+    // GitHub CDN hosts used after /releases/download/ redirects.
+    if (HostEquals(host, L"objects.githubusercontent.com") ||
+        HostEquals(host, L"release-assets.githubusercontent.com") ||
+        HostEquals(host, L"github-releases.githubusercontent.com")) {
+        return true;
+    }
+    return false;
 }
 
 bool HttpGetHttps(const wchar_t* host, const wchar_t* path, char** outBody, DWORD* outLen) {
@@ -238,9 +328,17 @@ bool HttpGetHttps(const wchar_t* host, const wchar_t* path, char** outBody, DWOR
         if (avail == 0) {
             break;
         }
+        if (len + avail + 1 > kMaxHttpBodyBytes) {
+            free(buf);
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return false;
+        }
         if (len + avail + 1 > cap) {
             const DWORD next = (cap == 0) ? (avail + 1 + 4096) : (cap * 2 + avail);
-            char* grown = static_cast<char*>(realloc(buf, next));
+            const DWORD capped = next > kMaxHttpBodyBytes + 1 ? (kMaxHttpBodyBytes + 1) : next;
+            char* grown = static_cast<char*>(realloc(buf, capped));
             if (!grown) {
                 free(buf);
                 WinHttpCloseHandle(request);
@@ -249,7 +347,7 @@ bool HttpGetHttps(const wchar_t* host, const wchar_t* path, char** outBody, DWOR
                 return false;
             }
             buf = grown;
-            cap = next;
+            cap = capped;
         }
         DWORD read = 0;
         if (!WinHttpReadData(request, buf + len, avail, &read) || read == 0) {
@@ -271,30 +369,40 @@ bool HttpGetHttps(const wchar_t* host, const wchar_t* path, char** outBody, DWOR
     return true;
 }
 
-bool CrackUrl(const wchar_t* url, wchar_t* host, size_t hostN, wchar_t* path, size_t pathN) {
-    URL_COMPONENTS uc{};
-    uc.dwStructSize = sizeof(uc);
-    uc.dwHostNameLength = static_cast<DWORD>(-1);
-    uc.dwUrlPathLength = static_cast<DWORD>(-1);
-    uc.dwExtraInfoLength = static_cast<DWORD>(-1);
-    if (!WinHttpCrackUrl(url, 0, 0, &uc)) {
-        return false;
+bool VerifyAuthenticode(const wchar_t* path) {
+    WINTRUST_FILE_INFO fileInfo{};
+    fileInfo.cbStruct = sizeof(fileInfo);
+    fileInfo.pcwszFilePath = path;
+
+    GUID policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA data{};
+    data.cbStruct = sizeof(data);
+    data.dwUIChoice = WTD_UI_NONE;
+    data.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
+    data.dwUnionChoice = WTD_CHOICE_FILE;
+    data.pFile = &fileInfo;
+    data.dwStateAction = WTD_STATEACTION_VERIFY;
+    data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+    const LONG status = WinVerifyTrust(nullptr, &policy, &data);
+
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &policy, &data);
+
+    // TRUST_E_NOSIGNATURE: CI does not Authenticode-sign yet. Host/asset
+    // allowlisting remains the integrity boundary until releases are signed.
+    // Any present-but-invalid signature is rejected.
+    if (status == ERROR_SUCCESS) {
+        return true;
     }
-    if (!uc.lpszHostName || uc.dwHostNameLength == 0 || !uc.lpszUrlPath) {
-        return false;
-    }
-    wcsncpy_s(host, hostN, uc.lpszHostName, uc.dwHostNameLength);
-    if (uc.lpszExtraInfo && uc.dwExtraInfoLength > 0) {
-        swprintf_s(path, pathN, L"%.*s%.*s",
-                   static_cast<int>(uc.dwUrlPathLength), uc.lpszUrlPath,
-                   static_cast<int>(uc.dwExtraInfoLength), uc.lpszExtraInfo);
-    } else {
-        wcsncpy_s(path, pathN, uc.lpszUrlPath, uc.dwUrlPathLength);
-    }
-    return true;
+    return status == TRUST_E_NOSIGNATURE;
 }
 
 bool DownloadFile(const wchar_t* url, const wchar_t* destPath) {
+    if (!IsAllowedDownloadUrl(url)) {
+        return false;
+    }
+
     wchar_t host[256]{};
     wchar_t path[1024]{};
     if (!CrackUrl(url, host, 256, path, 1024)) {
@@ -319,11 +427,109 @@ bool DownloadFile(const wchar_t* url, const wchar_t* destPath) {
         return false;
     }
 
-    BOOL ok = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                 WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-    if (!ok || !WinHttpReceiveResponse(request, nullptr)) {
+    // Manual redirect loop (GitHub release assets usually hop once to the CDN).
+    // Disable auto-redirect and re-validate each Location against the allowlist.
+    auto disableRedirects = [](HINTERNET req) {
+        DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
+    };
+    disableRedirects(request);
+
+    bool haveBody = false;
+    for (int hop = 0; hop < 5; ++hop) {
+        BOOL ok = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                     WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+        if (!ok || !WinHttpReceiveResponse(request, nullptr)) {
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return false;
+        }
+
+        DWORD status = 0;
+        DWORD statusSize = sizeof(status);
+        WinHttpQueryHeaders(request,
+                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX,
+                            &status,
+                            &statusSize,
+                            WINHTTP_NO_HEADER_INDEX);
+
+        if (status == 200) {
+            haveBody = true;
+            break;
+        }
+        if (status != 301 && status != 302 && status != 307 && status != 308) {
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return false;
+        }
+
+        wchar_t location[1024]{};
+        DWORD locSize = sizeof(location);
+        if (!WinHttpQueryHeaders(request,
+                                 WINHTTP_QUERY_LOCATION,
+                                 WINHTTP_HEADER_NAME_BY_INDEX,
+                                 location,
+                                 &locSize,
+                                 WINHTTP_NO_HEADER_INDEX)) {
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return false;
+        }
+
+        wchar_t nextUrl[1024]{};
+        if (wcsncmp(location, L"https://", 8) == 0) {
+            wcsncpy_s(nextUrl, location, _TRUNCATE);
+        } else if (location[0] == L'/') {
+            swprintf_s(nextUrl, L"https://%s%s", host, location);
+        } else {
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return false;
+        }
+
+        if (!IsAllowedDownloadUrl(nextUrl)) {
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return false;
+        }
+
         WinHttpCloseHandle(request);
         WinHttpCloseHandle(connect);
+        request = nullptr;
+        connect = nullptr;
+
+        if (!CrackUrl(nextUrl, host, 256, path, 1024)) {
+            WinHttpCloseHandle(session);
+            return false;
+        }
+        connect = WinHttpConnect(session, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!connect) {
+            WinHttpCloseHandle(session);
+            return false;
+        }
+        request = WinHttpOpenRequest(connect, L"GET", path, nullptr, WINHTTP_NO_REFERER,
+                                     WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!request) {
+            WinHttpCloseHandle(connect);
+            WinHttpCloseHandle(session);
+            return false;
+        }
+        disableRedirects(request);
+    }
+
+    if (!haveBody) {
+        if (request) {
+            WinHttpCloseHandle(request);
+        }
+        if (connect) {
+            WinHttpCloseHandle(connect);
+        }
         WinHttpCloseHandle(session);
         return false;
     }
@@ -339,6 +545,7 @@ bool DownloadFile(const wchar_t* url, const wchar_t* destPath) {
 
     BYTE scratch[64 * 1024];
     bool success = true;
+    ULONGLONG total = 0;
     for (;;) {
         if (g_stop.load()) {
             success = false;
@@ -359,6 +566,11 @@ bool DownloadFile(const wchar_t* url, const wchar_t* destPath) {
         if (!WinHttpReadData(request, scratch, avail, &read) || read == 0) {
             break;
         }
+        total += read;
+        if (total > kMaxInstallerBytes) {
+            success = false;
+            break;
+        }
         DWORD written = 0;
         if (!WriteFile(file, scratch, read, &written, nullptr) || written != read) {
             success = false;
@@ -372,8 +584,13 @@ bool DownloadFile(const wchar_t* url, const wchar_t* destPath) {
     WinHttpCloseHandle(session);
     if (!success) {
         DeleteFileW(destPath);
+        return false;
     }
-    return success;
+    if (!VerifyAuthenticode(destPath)) {
+        DeleteFileW(destPath);
+        return false;
+    }
+    return true;
 }
 
 DWORD WINAPI CheckThread(LPVOID param) {
@@ -398,6 +615,12 @@ DWORD WINAPI CheckThread(LPVOID param) {
         return 0;
     }
 
+    wchar_t wideUrl[512]{};
+    if (!Utf8ToWide(url, wideUrl, 512) || !IsAllowedDownloadUrl(wideUrl)) {
+        SetState(UpdateChecker::State::Failed, L"Update check failed", notify);
+        return 0;
+    }
+
     if (CompareSemver(tag, APP_VERSION) <= 0) {
         EnsureCs();
         EnterCriticalSection(&g_cs);
@@ -414,11 +637,16 @@ DWORD WINAPI CheckThread(LPVOID param) {
     if (g_remoteVersion[0] == L'v' || g_remoteVersion[0] == L'V') {
         wmemmove(g_remoteVersion, g_remoteVersion + 1, wcslen(g_remoteVersion));
     }
-    Utf8ToWide(url, g_downloadUrl, 512);
+    wcsncpy_s(g_downloadUrl, wideUrl, _TRUNCATE);
     LeaveCriticalSection(&g_cs);
 
     wchar_t status[96];
-    swprintf_s(status, L"Update v%s available", g_remoteVersion);
+    wchar_t versionCopy[32]{};
+    EnsureCs();
+    EnterCriticalSection(&g_cs);
+    wcsncpy_s(versionCopy, g_remoteVersion, _TRUNCATE);
+    LeaveCriticalSection(&g_cs);
+    swprintf_s(status, L"Update v%s available", versionCopy);
     SetState(UpdateChecker::State::Available, status, notify);
     return 0;
 }
@@ -433,7 +661,7 @@ DWORD WINAPI InstallThread(LPVOID param) {
     wcsncpy_s(url, g_downloadUrl, _TRUNCATE);
     LeaveCriticalSection(&g_cs);
 
-    if (!url[0]) {
+    if (!url[0] || !IsAllowedDownloadUrl(url)) {
         SetState(UpdateChecker::State::Failed, L"No download URL", notify);
         if (notify && IsWindow(notify)) {
             PostMessageW(notify, WM_APP_UPDATE_INSTALL_DONE, 0, 0);
@@ -541,12 +769,24 @@ State GetState() {
     return s;
 }
 
-const wchar_t* AvailableVersion() {
-    return g_remoteVersion;
+void CopyAvailableVersion(wchar_t* out, size_t outChars) {
+    if (!out || outChars == 0) {
+        return;
+    }
+    EnsureCs();
+    EnterCriticalSection(&g_cs);
+    wcsncpy_s(out, outChars, g_remoteVersion, _TRUNCATE);
+    LeaveCriticalSection(&g_cs);
 }
 
-const wchar_t* StatusText() {
-    return g_status;
+void CopyStatusText(wchar_t* out, size_t outChars) {
+    if (!out || outChars == 0) {
+        return;
+    }
+    EnsureCs();
+    EnterCriticalSection(&g_cs);
+    wcsncpy_s(out, outChars, g_status, _TRUNCATE);
+    LeaveCriticalSection(&g_cs);
 }
 
 void BeginInstall(HWND notifyHwnd) {
