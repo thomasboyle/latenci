@@ -1,6 +1,8 @@
 /.vs/
 /out/
 /build/
+/build-before/
+/build-after/
 /dist/
 /cmake-build-*/
 *.user
