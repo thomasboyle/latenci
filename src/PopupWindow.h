@@ -130,6 +130,10 @@ private:
     void RefreshAndInvalidate();
     void ForceRepaint();
     float MeasureText(const wchar_t* text, IDWriteTextFormat* fmt, float maxW) const;
+    // Measures text once per (text, maxW) pair; the stat-pair and section labels
+    // are compile-time constants, so their widths never change and the per-frame
+    // CreateTextLayout allocations are wasted work.
+    float CachedLabelWidth(const wchar_t* text, IDWriteTextFormat* fmt, float maxW);
     void RefreshLabelMetrics();
     float ToDips(int clientPixels) const;
 
@@ -180,6 +184,16 @@ private:
     bool haveLabelMetrics_ = false;
     wchar_t speedPillMeasuredFor_[32]{};
     float speedPillTextW_ = 0.0f;
+    // Label width cache: {text pointer, maxW, measured width} triplets for the
+    // constant labels measured during DrawMainBody/DrawSettingsBody.
+    struct LabelWidthEntry {
+        const wchar_t* text;
+        float maxW;
+        float width;
+    };
+    static constexpr int kLabelWidthCacheSize = 16;
+    LabelWidthEntry labelWidths_[kLabelWidthCacheSize]{};
+    int labelWidthCount_ = 0;
 
     NetworkSnapshot snap_{};
     DnsProvider dnsProvider_ = DnsProvider::Dhcp;

@@ -578,6 +578,19 @@ void PopupWindow::RefreshLabelMetrics() {
     haveLabelMetrics_ = true;
 }
 
+float PopupWindow::CachedLabelWidth(const wchar_t* text, IDWriteTextFormat* fmt, float maxW) {
+    for (int i = 0; i < labelWidthCount_; ++i) {
+        if (labelWidths_[i].maxW == maxW && wcscmp(labelWidths_[i].text, text) == 0) {
+            return labelWidths_[i].width;
+        }
+    }
+    const float width = MeasureText(text, fmt, maxW);
+    if (labelWidthCount_ < kLabelWidthCacheSize) {
+        labelWidths_[labelWidthCount_++] = {text, maxW, width};
+    }
+    return width;
+}
+
 bool PopupWindow::EnsureDeviceResources() {
     if (renderTarget_) {
         return true;
@@ -752,6 +765,7 @@ void PopupWindow::DiscardDeviceResources() {
         renderTarget_ = nullptr;
     }
     haveLabelMetrics_ = false;
+    labelWidthCount_ = 0;
     speedPillMeasuredFor_[0] = L'\0';
     speedPillTextW_ = 0.0f;
 }
@@ -988,7 +1002,7 @@ void PopupWindow::DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, floa
         const float gap = Theme::kLabelFieldGap + 2.0f;
 
         auto drawCol = [&](float x0, float x1, const wchar_t* label, const wchar_t* value) {
-            float labelW = MeasureText(label, fmtLabel_, colW);
+            float labelW = CachedLabelWidth(label, fmtLabel_, colW);
             // Keep value column usable even for long labels (e.g. "IP Address").
             const float maxLabelW = colW * 0.58f;
             if (labelW > maxLabelW) {
@@ -1029,7 +1043,7 @@ void PopupWindow::DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, floa
         const float gap = Theme::kLabelFieldGap + 2.0f;
 
         auto drawCol = [&](float x0, float x1, const wchar_t* label, const wchar_t* value) {
-            float labelW = MeasureText(label, fmtLabel_, colW);
+            float labelW = CachedLabelWidth(label, fmtLabel_, colW);
             const float maxLabelW = colW * 0.58f;
             if (labelW > maxLabelW) {
                 labelW = maxLabelW;
@@ -1131,7 +1145,7 @@ void PopupWindow::DrawSettingsBody(ID2D1RenderTarget* rt, const VisualState& v, 
     rt->DrawLine(D2D1::Point2F(pad, y), D2D1::Point2F(w - pad, y), brushHair_, 1.0f);
     y += Theme::kSectionGap;
 
-    const float updatesTitleW = MeasureText(L"Updates", fmtSection_, w - 2 * pad);
+    const float updatesTitleW = CachedLabelWidth(L"Updates", fmtSection_, w - 2 * pad);
     drawText(L"Updates", D2D1::RectF(pad, y, w - pad, y + Theme::kSectionSize + 2.0f),
              fmtSection_, brushSubtitle_);
     rt->DrawLine(D2D1::Point2F(pad, y + Theme::kSectionSize + 1.0f),
@@ -1145,7 +1159,7 @@ void PopupWindow::DrawSettingsBody(ID2D1RenderTarget* rt, const VisualState& v, 
     y += Theme::kLabelSize + Theme::kRowGap;
 
     const wchar_t* checkLabel = v.updateBusy ? L"..." : L"Check for updates";
-    float checkW = MeasureText(checkLabel, fmtPill_, w - 2 * pad) + 28.0f;
+    float checkW = CachedLabelWidth(checkLabel, fmtPill_, w - 2 * pad) + 28.0f;
     if (checkW < 140.0f) {
         checkW = 140.0f;
     }
