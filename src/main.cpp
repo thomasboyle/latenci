@@ -272,6 +272,7 @@ bool PromptCustomDns(HWND owner, wchar_t* inout, size_t inoutChars) {
     if (owner) {
         SetForegroundWindow(owner);
     }
+    g_promptBuffer = nullptr;
     return g_promptAccepted;
 }
 
