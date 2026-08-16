@@ -102,7 +102,7 @@ Values include DNS provider, custom DNS list, and ping target (default `1.1.1.1`
 | `Autostart` | Task Scheduler logon task for elevated startup |
 | `Fonts` | Embedded Pixelify Sans via DirectWrite custom font collection |
 
-Stats paint is data-driven: the UI invalidates only on `WM_APP_STATS_UPDATED` (1 Hz while the flyout is open), not on a free-running redraw timer. Live polling and ping park when the popup is hidden so idle cost stays low.
+Stats paint is data-driven: the UI invalidates only on `WM_APP_STATS_UPDATED` (1 Hz while the flyout is open), not on a free-running redraw timer. Ping parking gates the ICMP worker while the popup is hidden; the 1 Hz interface poll keeps running (posting to the hidden window is suppressed), so idle cost stays low.
 
 ## Layout
 

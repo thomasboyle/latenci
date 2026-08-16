@@ -120,21 +120,26 @@ private:
     void DrawPanel(ID2D1RenderTarget* rt);
     void DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, float& y);
     void DrawSettingsBody(ID2D1RenderTarget* rt, const VisualState& v, float& y);
+    void DrawText(ID2D1RenderTarget* rt, const wchar_t* text, const D2D1_RECT_F& rc,
+                  IDWriteTextFormat* fmt, ID2D1Brush* br) const;
+    void DrawChunkyButton(ID2D1RenderTarget* rt, const D2D1_RECT_F& rc, bool primary,
+                          bool hot, const wchar_t* label);
     void Layout();
     PopupHit HitTest(float x, float y) const;
     void ApplyPaperChrome();
     bool IsInteractiveHit(PopupHit hit) const;
     void BeginDrag();
 
-    void RebuildVisual();
+    void RebuildVisual(VisualState& v);
     void RefreshAndInvalidate();
     void ForceRepaint();
     float MeasureText(const wchar_t* text, IDWriteTextFormat* fmt, float maxW) const;
-    // Measures text once per (text, maxW) pair; the stat-pair and section labels
-    // are compile-time constants, so their widths never change and the per-frame
-    // CreateTextLayout allocations are wasted work.
+    // Measures text once per (text, fmt, maxW) triple; the stat-pair and section
+    // labels are compile-time constants, so their widths never change and the
+    // per-frame CreateTextLayout allocations are wasted work.
     float CachedLabelWidth(const wchar_t* text, IDWriteTextFormat* fmt, float maxW);
     void RefreshLabelMetrics();
+    bool EnsureChromeTiles(ID2D1RenderTarget* rt);
     float ToDips(int clientPixels) const;
 
     IDWriteTextFormat* Format(float size, DWRITE_FONT_WEIGHT weight);
@@ -178,16 +183,20 @@ private:
     ID2D1SolidColorBrush* brushGold_ = nullptr;
     ID2D1SolidColorBrush* brushOnGold_ = nullptr;
     ID2D1BitmapBrush* grainBrush_ = nullptr;
+    // Pre-rendered static chrome (icon badge glyph, corner leaf): collapsed ~55
+    // per-frame FillRectangle calls into one tile blit each. Drawn with linear
+    // interpolation so scaled-DPI rendering matches the old AA'd rect fills.
+    ID2D1Bitmap* badgeGlyphTile_ = nullptr;
+    ID2D1Bitmap* leafTile_ = nullptr;
 
     float sectionSpeedTestW_ = 0.0f;
     float sectionDnsW_ = 0.0f;
     bool haveLabelMetrics_ = false;
-    wchar_t speedPillMeasuredFor_[32]{};
-    float speedPillTextW_ = 0.0f;
-    // Label width cache: {text pointer, maxW, measured width} triplets for the
+    // Label width cache: {text, fmt, maxW, measured width} quadruplets for the
     // constant labels measured during DrawMainBody/DrawSettingsBody.
     struct LabelWidthEntry {
         const wchar_t* text;
+        IDWriteTextFormat* fmt;
         float maxW;
         float width;
     };

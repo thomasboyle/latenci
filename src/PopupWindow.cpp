@@ -134,7 +134,7 @@ bool PopupWindow::Create(HINSTANCE instance, HWND owner) {
     SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
     ApplyPaperChrome();
     Layout();
-    RebuildVisual();
+    RebuildVisual(visual_);
     return true;
 }
 
@@ -230,7 +230,7 @@ void PopupWindow::ShowNearTray(const POINT& anchorScreen, ShowMode mode) {
         SetForegroundWindow(hwnd_);
     }
     Layout();
-    RebuildVisual();
+    RebuildVisual(visual_);
     ForceRepaint();
     if (onVisibility_) {
         onVisibility_(true);
@@ -281,8 +281,7 @@ bool PopupWindow::ContainsScreenPoint(POINT screenPt) const {
     return PtInRect(&rc, screenPt) != FALSE;
 }
 
-void PopupWindow::RebuildVisual() {
-    VisualState v{};
+void PopupWindow::RebuildVisual(VisualState& v) {
     if (panelView_ == PanelView::Settings) {
         wcsncpy_s(v.title, L"Settings", _TRUNCATE);
         wcsncpy_s(v.connection, L"Latenci", _TRUNCATE);
@@ -312,18 +311,22 @@ void PopupWindow::RebuildVisual() {
     v.autostart = autostartEnabled_;
     v.updateAvailable = updateAvailable_;
     v.updateBusy = updateBusy_;
-    memcpy(&visual_, &v, sizeof(VisualState));
 }
 
 void PopupWindow::RefreshAndInvalidate() {
-    RebuildVisual();
+    VisualState v{};
+    RebuildVisual(v);
     if (!IsVisible()) {
+        // Hidden windows never paint; keep the stale-copy semantics so a later
+        // ForceRepaint/Show paints the freshest state.
+        visual_ = v;
         return;
     }
     // Nothing the user can see moved — skip the repaint entirely.
-    if (memcmp(&visual_, &painted_, sizeof(VisualState)) == 0) {
+    if (memcmp(&v, &painted_, sizeof(VisualState)) == 0) {
         return;
     }
+    visual_ = v;
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -580,15 +583,50 @@ void PopupWindow::RefreshLabelMetrics() {
 
 float PopupWindow::CachedLabelWidth(const wchar_t* text, IDWriteTextFormat* fmt, float maxW) {
     for (int i = 0; i < labelWidthCount_; ++i) {
-        if (labelWidths_[i].maxW == maxW && wcscmp(labelWidths_[i].text, text) == 0) {
-            return labelWidths_[i].width;
+        if (labelWidths_[i].fmt == fmt && labelWidths_[i].maxW == maxW) {
+            // All call sites pass string literals, so the pointer comparison is
+            // the common-case hit; wcscmp is the conservative fallback.
+            if (labelWidths_[i].text == text ||
+                wcscmp(labelWidths_[i].text, text) == 0) {
+                return labelWidths_[i].width;
+            }
         }
     }
     const float width = MeasureText(text, fmt, maxW);
     if (labelWidthCount_ < kLabelWidthCacheSize) {
-        labelWidths_[labelWidthCount_++] = {text, maxW, width};
+        labelWidths_[labelWidthCount_++] = {text, fmt, maxW, width};
     }
     return width;
+}
+
+void PopupWindow::DrawText(ID2D1RenderTarget* rt, const wchar_t* text,
+                           const D2D1_RECT_F& rc, IDWriteTextFormat* fmt,
+                           ID2D1Brush* br) const {
+    if (!fmt || !br) {
+        return;
+    }
+    rt->DrawTextW(text, static_cast<UINT32>(wcslen(text)), fmt, rc, br,
+                  D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                  DWRITE_MEASURING_MODE_NATURAL);
+}
+
+void PopupWindow::DrawChunkyButton(ID2D1RenderTarget* rt, const D2D1_RECT_F& rc,
+                                   bool primary, bool hot, const wchar_t* label) {
+    const float rad = Theme::kControlRadius;
+    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rc, rad, rad);
+    ID2D1SolidColorBrush* fill = primary
+        ? (hot ? brushAccentHover_ : brushStippleBtn_)
+        : brushSurface_;
+    ID2D1SolidColorBrush* edge = primary ? brushInk_ : brushSurfaceBorder_;
+    const float bottomW = primary ? Theme::kBtnBorderBottom
+                                  : (hot ? Theme::kBtnBorderBottom : Theme::kSecondaryBottom);
+    rt->FillRoundedRectangle(rr, fill);
+    rt->DrawRoundedRectangle(rr, edge, Theme::kBtnBorderSide);
+    rt->DrawLine(
+        D2D1::Point2F(rc.left + rad, rc.bottom - 0.5f),
+        D2D1::Point2F(rc.right - rad, rc.bottom - 0.5f),
+        edge, bottomW);
+    DrawText(rt, label, rc, fmtPill_, brushInk_);
 }
 
 bool PopupWindow::EnsureDeviceResources() {
@@ -754,7 +792,115 @@ bool PopupWindow::EnsureGrainBrush(ID2D1RenderTarget* rt) {
     return SUCCEEDED(hr) && grainBrush_;
 }
 
+bool PopupWindow::EnsureChromeTiles(ID2D1RenderTarget* rt) {
+    if (badgeGlyphTile_ && leafTile_) {
+        return true;
+    }
+    if (!brushIconFg_ || !brushLeaf_) {
+        return false;
+    }
+
+    // Static chrome is drawn as pixel rects once into a tile, then blitted per
+    // paint: the badge glyph is ~30 FillRectangle calls and the corner leaf is
+    // ~14, and both are invariant while the window lives. The tiles inherit the
+    // target's DPI, and linear interpolation keeps scaled-DPI AA looking like
+    // the old direct-rect rendering.
+    auto finishTile = [](ID2D1BitmapRenderTarget* layer, ID2D1Bitmap** out) -> bool {
+        if (FAILED(layer->EndDraw())) {
+            layer->Release();
+            return false;
+        }
+        ID2D1Bitmap* tile = nullptr;
+        const HRESULT hr = layer->GetBitmap(&tile);
+        layer->Release();
+        if (FAILED(hr) || !tile) {
+            return false;
+        }
+        *out = tile;
+        return true;
+    };
+
+    // Badge glyph: 2×2-pixel squares of the ethernet port + two leaf pixels.
+    {
+        ID2D1BitmapRenderTarget* layer = nullptr;
+        if (FAILED(rt->CreateCompatibleRenderTarget(
+                D2D1::SizeF(16.0f, 16.0f),
+                D2D1::SizeU(16, 16),
+                rt->GetPixelFormat(),
+                D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, &layer)) || !layer) {
+            return false;
+        }
+        layer->BeginDraw();
+        layer->Clear(D2D1::ColorF(0, 0, 0, 0));
+        auto px = [&](float x, float y, float s = 2.0f) {
+            layer->FillRectangle(D2D1::RectF(x, y, x + s, y + s), brushIconFg_);
+        };
+        for (int x = 0; x <= 7; ++x) {
+            px(static_cast<float>(x) * 2.0f, 0.0f);
+            px(static_cast<float>(x) * 2.0f, 10.0f);
+        }
+        for (int y = 1; y <= 4; ++y) {
+            px(0.0f, static_cast<float>(y) * 2.0f);
+            px(14.0f, static_cast<float>(y) * 2.0f);
+        }
+        px(4.0f, 12.0f);
+        px(6.0f, 12.0f);
+        px(8.0f, 12.0f);
+        px(10.0f, 12.0f);
+        if (brushLeaf_) {
+            layer->FillRectangle(D2D1::RectF(4.0f, 4.0f, 6.0f, 6.0f), brushLeaf_);
+            layer->FillRectangle(D2D1::RectF(8.0f, 6.0f, 10.0f, 8.0f), brushLeaf_);
+        }
+        if (!finishTile(layer, &badgeGlyphTile_)) {
+            return false;
+        }
+    }
+
+    // Corner leaf decoration (bottom-right of the panel).
+    {
+        ID2D1BitmapRenderTarget* layer = nullptr;
+        if (FAILED(rt->CreateCompatibleRenderTarget(
+                D2D1::SizeF(16.0f, 16.0f),
+                D2D1::SizeU(16, 16),
+                rt->GetPixelFormat(),
+                D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, &layer)) || !layer) {
+            return false;
+        }
+        layer->BeginDraw();
+        layer->Clear(D2D1::ColorF(0, 0, 0, 0));
+        auto leafPx = [&](float x, float y) {
+            layer->FillRectangle(D2D1::RectF(x, y, x + 2.0f, y + 2.0f), brushLeaf_);
+        };
+        leafPx(8.0f, 14.0f);
+        leafPx(8.0f, 12.0f);
+        leafPx(8.0f, 10.0f);
+        leafPx(8.0f, 8.0f);
+        leafPx(4.0f, 6.0f);
+        leafPx(2.0f, 4.0f);
+        leafPx(4.0f, 4.0f);
+        leafPx(6.0f, 6.0f);
+        leafPx(10.0f, 6.0f);
+        leafPx(12.0f, 4.0f);
+        leafPx(14.0f, 4.0f);
+        leafPx(12.0f, 6.0f);
+        leafPx(6.0f, 2.0f);
+        leafPx(10.0f, 2.0f);
+        if (!finishTile(layer, &leafTile_)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void PopupWindow::DiscardDeviceResources() {
+    if (badgeGlyphTile_) {
+        badgeGlyphTile_->Release();
+        badgeGlyphTile_ = nullptr;
+    }
+    if (leafTile_) {
+        leafTile_->Release();
+        leafTile_ = nullptr;
+    }
     if (grainBrush_) {
         grainBrush_->Release();
         grainBrush_ = nullptr;
@@ -766,8 +912,6 @@ void PopupWindow::DiscardDeviceResources() {
     }
     haveLabelMetrics_ = false;
     labelWidthCount_ = 0;
-    speedPillMeasuredFor_[0] = L'\0';
-    speedPillTextW_ = 0.0f;
 }
 
 void PopupWindow::Paint() {
@@ -793,6 +937,7 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
         return;
     }
     EnsureGrainBrush(rt);
+    EnsureChromeTiles(rt);
 
     const VisualState& v = visual_;
     const float w = Theme::kPanelWidth;
@@ -808,24 +953,22 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
         rt->FillRectangle(D2D1::RectF(0, 0, w, h), grainBrush_);
     }
 
-    auto drawText = [&](const wchar_t* text, const D2D1_RECT_F& rc,
-                        IDWriteTextFormat* fmt, ID2D1Brush* br) {
-        if (!fmt || !br) return;
-        rt->DrawTextW(text, static_cast<UINT32>(wcslen(text)), fmt, rc, br,
-                      D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                      DWRITE_MEASURING_MODE_NATURAL);
-    };
-
     // --- Header ---
     const float badge = Theme::kIconBadgeSize;
-    iconBtn_ = D2D1::RectF(pad, pad, pad + badge, pad + badge);
+    // iconBtn_ / closeBtn_ are maintained by Layout(); hit-testing and painting
+    // share the same rects.
     const bool iconHot = (v.hover == PopupHit::IconBadge);
     const D2D1_ROUNDED_RECT badgeRc = D2D1::RoundedRect(iconBtn_, Theme::kIconBadgeRadius, Theme::kIconBadgeRadius);
     rt->FillRoundedRectangle(badgeRc, iconHot ? brushAccentHover_ : brushIconBg_);
     rt->DrawRoundedRectangle(badgeRc, brushIconFg_, iconHot ? 1.5f : 1.0f);
 
-    // Soft pixel ethernet glyph (blocky silhouette)
-    {
+    // Soft pixel ethernet glyph (blocky silhouette), pre-rendered into a tile.
+    if (badgeGlyphTile_) {
+        const float bx = pad + 6.0f;
+        const float by = pad + 7.0f;
+        rt->DrawBitmap(badgeGlyphTile_, D2D1::RectF(bx, by, bx + 16.0f, by + 16.0f),
+                       1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    } else {
         const float bx = pad + 6.0f;
         const float by = pad + 7.0f;
         auto px = [&](float x, float y, float s = 2.0f) {
@@ -858,30 +1001,25 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
                                               dot * 0.5f, dot * 0.5f);
         rt->FillEllipse(el, brushGold_);
         rt->DrawEllipse(el, brushInk_, 1.0f);
-        drawText(L"i", D2D1::RectF(dx0, dy0 - 0.5f, dx0 + dot, dy0 + dot), fmtBadge_, brushOnGold_);
+        DrawText(rt, L"i", D2D1::RectF(dx0, dy0 - 0.5f, dx0 + dot, dy0 + dot), fmtBadge_, brushOnGold_);
     }
 
     const float titleRightPad = (v.mode == ShowMode::Pinned)
         ? (Theme::kCloseSize + Theme::kCloseHitPad * 2.0f + 100.0f)
         : 90.0f;
-    drawText(v.title,
+    DrawText(rt, v.title,
              D2D1::RectF(pad + badge + 10.0f, pad - 1.0f, w - pad - titleRightPad, pad + 22.0f),
              fmtTitle_, brushInk_);
-    drawText(v.connection,
+    DrawText(rt, v.connection,
              D2D1::RectF(pad + badge + 10.0f, pad + 20.0f, w - pad - titleRightPad, pad + 36.0f),
              fmtBrand_, brushDim_);
 
     float speedPillRight = w - pad;
     if (v.mode == ShowMode::Pinned) {
-        const float cx1 = w - pad;
-        const float cx0 = cx1 - Theme::kCloseSize;
-        const float cy0 = pad + (Theme::kIconBadgeSize - Theme::kCloseSize) * 0.5f;
-        const float cy1 = cy0 + Theme::kCloseSize;
-        closeBtn_ = D2D1::RectF(
-            cx0 - Theme::kCloseHitPad,
-            cy0 - Theme::kCloseHitPad,
-            cx1 + Theme::kCloseHitPad,
-            cy1 + Theme::kCloseHitPad);
+        const float cx0 = closeBtn_.left + Theme::kCloseHitPad;
+        const float cx1 = closeBtn_.right - Theme::kCloseHitPad;
+        const float cy0 = closeBtn_.top + Theme::kCloseHitPad;
+        const float cy1 = closeBtn_.bottom - Theme::kCloseHitPad;
 
         ID2D1SolidColorBrush* brushClose = brushMuted_;
         if (v.hover == PopupHit::Close) {
@@ -896,36 +1034,15 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
     }
 
     if (v.view == PanelView::Main) {
-        auto drawChunkyButton = [&](const D2D1_RECT_F& rc, bool primary, bool hot,
-                                    const wchar_t* label) {
-            const float rad = Theme::kControlRadius;
-            D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rc, rad, rad);
-            ID2D1SolidColorBrush* fill = primary
-                ? (hot ? brushAccentHover_ : brushStippleBtn_)
-                : brushSurface_;
-            ID2D1SolidColorBrush* edge = primary ? brushInk_ : brushSurfaceBorder_;
-            const float bottomW = primary ? Theme::kBtnBorderBottom
-                                          : (hot ? Theme::kBtnBorderBottom : Theme::kSecondaryBottom);
-            rt->FillRoundedRectangle(rr, fill);
-            rt->DrawRoundedRectangle(rr, edge, Theme::kBtnBorderSide);
-            rt->DrawLine(
-                D2D1::Point2F(rc.left + rad, rc.bottom - 0.5f),
-                D2D1::Point2F(rc.right - rad, rc.bottom - 0.5f),
-                edge, bottomW);
-            drawText(label, rc, fmtPill_, brushInk_);
-        };
-
-        if (wcscmp(speedPillMeasuredFor_, v.linkSpeed) != 0) {
-            speedPillTextW_ = MeasureText(v.linkSpeed, fmtPill_, 200.0f);
-            wcsncpy_s(speedPillMeasuredFor_, v.linkSpeed, _TRUNCATE);
-        }
-        const float textW = speedPillTextW_ < 1.0f ? 48.0f : speedPillTextW_;
-        const float pillW = textW + Theme::kSpeedPillPadX * 2.0f;
+        // linkSpeed changes only on adapter re-resolve, so this is cache-hit
+        // territory; the shared cache covers the 48 DIP minimum-fallback too.
+        const float textW = CachedLabelWidth(v.linkSpeed, fmtPill_, 200.0f);
+        const float pillW = (textW < 1.0f ? 48.0f : textW) + Theme::kSpeedPillPadX * 2.0f;
         const float px1 = speedPillRight;
         const float px0 = px1 - pillW;
         const float py0 = pad + (badge - Theme::kSpeedPillH) * 0.5f;
         const float py1 = py0 + Theme::kSpeedPillH;
-        drawChunkyButton(D2D1::RectF(px0, py0, px1, py1), false, false, v.linkSpeed);
+        DrawChunkyButton(rt, D2D1::RectF(px0, py0, px1, py1), false, false, v.linkSpeed);
     }
 
     float y = pad + badge + Theme::kSectionGap;
@@ -935,7 +1052,12 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
         DrawMainBody(rt, v, y);
     }
 
-    if (brushLeaf_) {
+    if (leafTile_) {
+        const float lx = w - pad - 18.0f;
+        const float ly = h - pad - 16.0f;
+        rt->DrawBitmap(leafTile_, D2D1::RectF(lx, ly, lx + 16.0f, ly + 16.0f),
+                       1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    } else if (brushLeaf_) {
         const float lx = w - pad - 18.0f;
         const float ly = h - pad - 16.0f;
         auto leafPx = [&](float x, float y) {
@@ -962,57 +1084,32 @@ void PopupWindow::DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, floa
     const float w = Theme::kPanelWidth;
     const float pad = Theme::kPadding;
 
-    auto drawText = [&](const wchar_t* text, const D2D1_RECT_F& rc,
-                        IDWriteTextFormat* fmt, ID2D1Brush* br) {
-        if (!fmt || !br) return;
-        rt->DrawTextW(text, static_cast<UINT32>(wcslen(text)), fmt, rc, br,
-                      D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                      DWRITE_MEASURING_MODE_NATURAL);
-    };
     auto drawSectionTitle = [&](const wchar_t* text, float textW, float x, float y0, float maxRight) {
         const float titleH = Theme::kSectionSize + 2.0f;
-        drawText(text, D2D1::RectF(x, y0, maxRight, y0 + titleH), fmtSection_, brushSubtitle_);
+        DrawText(rt, text, D2D1::RectF(x, y0, maxRight, y0 + titleH), fmtSection_, brushSubtitle_);
         const float uy = y0 + Theme::kSectionSize + 1.0f;
         rt->DrawLine(D2D1::Point2F(x, uy), D2D1::Point2F(x + textW, uy), brushSubtitle_, 1.0f);
     };
-    auto drawChunkyButton = [&](const D2D1_RECT_F& rc, bool primary, bool hot,
-                                const wchar_t* label) {
-        const float rad = Theme::kControlRadius;
-        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rc, rad, rad);
-        ID2D1SolidColorBrush* fill = primary
-            ? (hot ? brushAccentHover_ : brushStippleBtn_)
-            : brushSurface_;
-        ID2D1SolidColorBrush* edge = primary ? brushInk_ : brushSurfaceBorder_;
-        const float bottomW = primary ? Theme::kBtnBorderBottom
-                                      : (hot ? Theme::kBtnBorderBottom : Theme::kSecondaryBottom);
-        rt->FillRoundedRectangle(rr, fill);
-        rt->DrawRoundedRectangle(rr, edge, Theme::kBtnBorderSide);
-        rt->DrawLine(
-            D2D1::Point2F(rc.left + rad, rc.bottom - 0.5f),
-            D2D1::Point2F(rc.right - rad, rc.bottom - 0.5f),
-            edge, bottomW);
-        drawText(label, rc, fmtPill_, brushInk_);
+    // Column geometry is identical for the two stat rows; reuse one lambda.
+    auto drawCol = [&](float x0, float x1, const wchar_t* label, const wchar_t* value) {
+        const float colW = (w - 2 * pad) * 0.5f - 8.0f;
+        const float rowH = Theme::kLabelSize + 4.0f;
+        const float gap = Theme::kLabelFieldGap + 2.0f;
+        float labelW = CachedLabelWidth(label, fmtLabel_, colW);
+        // Keep value column usable even for long labels (e.g. "IP Address").
+        const float maxLabelW = colW * 0.58f;
+        if (labelW > maxLabelW) {
+            labelW = maxLabelW;
+        }
+        const float split = x0 + labelW + gap;
+        DrawText(rt, label, D2D1::RectF(x0, y, split, y + rowH), fmtLabel_, brushLabel_);
+        DrawText(rt, value, D2D1::RectF(split, y, x1, y + rowH), fmtValue_, brushInk_);
     };
 
     auto drawStatPair = [&](const wchar_t* l1, const wchar_t* v1,
                             const wchar_t* l2, const wchar_t* v2) {
         const float mid = pad + (w - 2 * pad) * 0.5f + 6.0f;
-        const float colW = (w - 2 * pad) * 0.5f - 8.0f;
-        const float rowH = Theme::kLabelSize + 4.0f;
-        const float gap = Theme::kLabelFieldGap + 2.0f;
-
-        auto drawCol = [&](float x0, float x1, const wchar_t* label, const wchar_t* value) {
-            float labelW = CachedLabelWidth(label, fmtLabel_, colW);
-            // Keep value column usable even for long labels (e.g. "IP Address").
-            const float maxLabelW = colW * 0.58f;
-            if (labelW > maxLabelW) {
-                labelW = maxLabelW;
-            }
-            const float split = x0 + labelW + gap;
-            drawText(label, D2D1::RectF(x0, y, split, y + rowH), fmtLabel_, brushLabel_);
-            drawText(value, D2D1::RectF(split, y, x1, y + rowH), fmtValue_, brushInk_);
-        };
-        drawCol(pad, pad + colW, l1, v1);
+        drawCol(pad, pad + (w - 2 * pad) * 0.5f - 8.0f, l1, v1);
         drawCol(mid, w - pad, l2, v2);
         y += Theme::kLabelSize + Theme::kRowGap;
     };
@@ -1027,32 +1124,17 @@ void PopupWindow::DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, floa
     y += Theme::kSectionGap;
 
     drawSectionTitle(kSectionSpeedTest, sectionSpeedTestW_, pad, y + 6.0f, w * 0.55f);
-    runBtn_ = D2D1::RectF(w - pad - Theme::kRunButtonW, y,
-                          w - pad, y + Theme::kRunButtonH);
+    // runBtn_ is maintained by Layout(); paint only consumes it.
     {
         const bool hot = (v.hover == PopupHit::RunSpeedTest);
         const wchar_t* label = v.speedRunning ? L"..." : L"Run";
-        drawChunkyButton(runBtn_, true, hot, label);
+        DrawChunkyButton(rt, runBtn_, true, hot, label);
     }
     y += Theme::kRunButtonH + Theme::kRowGap;
 
     {
         const float mid = pad + (w - 2 * pad) * 0.5f + 6.0f;
-        const float colW = (w - 2 * pad) * 0.5f - 8.0f;
-        const float rowH = Theme::kLabelSize + 4.0f;
-        const float gap = Theme::kLabelFieldGap + 2.0f;
-
-        auto drawCol = [&](float x0, float x1, const wchar_t* label, const wchar_t* value) {
-            float labelW = CachedLabelWidth(label, fmtLabel_, colW);
-            const float maxLabelW = colW * 0.58f;
-            if (labelW > maxLabelW) {
-                labelW = maxLabelW;
-            }
-            const float split = x0 + labelW + gap;
-            drawText(label, D2D1::RectF(x0, y, split, y + rowH), fmtLabel_, brushLabel_);
-            drawText(value, D2D1::RectF(split, y, x1, y + rowH), fmtValue_, brushInk_);
-        };
-        drawCol(pad, pad + colW, L"Download", v.downloadMbps);
+        drawCol(pad, pad + (w - 2 * pad) * 0.5f - 8.0f, L"Download", v.downloadMbps);
         drawCol(mid, w - pad, L"Upload", v.uploadMbps);
         y += Theme::kLabelSize + Theme::kRowGap;
     }
@@ -1076,7 +1158,7 @@ void PopupWindow::DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, floa
 
     for (int i = 0; i < 4; ++i) {
         const float x0 = pad + i * segW;
-        dnsBtns_[i] = D2D1::RectF(x0, y, x0 + segW, y + Theme::kSegButtonH);
+        // dnsBtns_[i] is maintained by Layout(); paint only consumes it.
         const bool selected = (v.dns == dnsValues[i]);
         const bool hot = (v.hover == static_cast<PopupHit>(
             static_cast<int>(PopupHit::DnsDhcp) + i));
@@ -1093,7 +1175,7 @@ void PopupWindow::DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, floa
                 D2D1::Point2F(x0, y + Theme::kSegButtonH - 3.0f),
                 brushHair_, 1.0f);
         }
-        drawText(dnsLabels[i], dnsBtns_[i], fmtPill_, brushInk_);
+        DrawText(rt, dnsLabels[i], dnsBtns_[i], fmtPill_, brushInk_);
     }
 }
 
@@ -1101,43 +1183,17 @@ void PopupWindow::DrawSettingsBody(ID2D1RenderTarget* rt, const VisualState& v, 
     const float w = Theme::kPanelWidth;
     const float pad = Theme::kPadding;
 
-    auto drawText = [&](const wchar_t* text, const D2D1_RECT_F& rc,
-                        IDWriteTextFormat* fmt, ID2D1Brush* br) {
-        if (!fmt || !br) return;
-        rt->DrawTextW(text, static_cast<UINT32>(wcslen(text)), fmt, rc, br,
-                      D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                      DWRITE_MEASURING_MODE_NATURAL);
-    };
-    auto drawChunkyButton = [&](const D2D1_RECT_F& rc, bool primary, bool hot,
-                                const wchar_t* label) {
-        const float rad = Theme::kControlRadius;
-        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(rc, rad, rad);
-        ID2D1SolidColorBrush* fill = primary
-            ? (hot ? brushAccentHover_ : brushStippleBtn_)
-            : brushSurface_;
-        ID2D1SolidColorBrush* edge = primary ? brushInk_ : brushSurfaceBorder_;
-        const float bottomW = primary ? Theme::kBtnBorderBottom
-                                      : (hot ? Theme::kBtnBorderBottom : Theme::kSecondaryBottom);
-        rt->FillRoundedRectangle(rr, fill);
-        rt->DrawRoundedRectangle(rr, edge, Theme::kBtnBorderSide);
-        rt->DrawLine(
-            D2D1::Point2F(rc.left + rad, rc.bottom - 0.5f),
-            D2D1::Point2F(rc.right - rad, rc.bottom - 0.5f),
-            edge, bottomW);
-        drawText(label, rc, fmtPill_, brushInk_);
-    };
-
     const float rowH = Theme::kLabelSize + 4.0f;
-    drawText(L"Version", D2D1::RectF(pad, y, pad + 120.0f, y + rowH), fmtLabel_, brushLabel_);
-    drawText(v.appVersion, D2D1::RectF(pad + 120.0f, y, w - pad, y + rowH), fmtValue_, brushInk_);
+    DrawText(rt, L"Version", D2D1::RectF(pad, y, pad + 120.0f, y + rowH), fmtLabel_, brushLabel_);
+    DrawText(rt, v.appVersion, D2D1::RectF(pad + 120.0f, y, w - pad, y + rowH), fmtValue_, brushInk_);
     y += Theme::kLabelSize + Theme::kRowGap;
 
-    drawText(L"Launch at startup", D2D1::RectF(pad, y + 6.0f, w - pad - 84.0f, y + 6.0f + rowH),
+    DrawText(rt, L"Launch at startup", D2D1::RectF(pad, y + 6.0f, w - pad - 84.0f, y + 6.0f + rowH),
              fmtLabel_, brushLabel_);
-    startupBtn_ = D2D1::RectF(w - pad - 72.0f, y, w - pad, y + Theme::kSegButtonH);
+    // startupBtn_ is maintained by Layout(); paint only consumes it.
     {
         const bool hot = (v.hover == PopupHit::SettingsStartup);
-        drawChunkyButton(startupBtn_, v.autostart, hot, v.autostart ? L"On" : L"Off");
+        DrawChunkyButton(rt, startupBtn_, v.autostart, hot, v.autostart ? L"On" : L"Off");
     }
     y += Theme::kSegButtonH + Theme::kRowGap;
 
@@ -1146,7 +1202,7 @@ void PopupWindow::DrawSettingsBody(ID2D1RenderTarget* rt, const VisualState& v, 
     y += Theme::kSectionGap;
 
     const float updatesTitleW = CachedLabelWidth(L"Updates", fmtSection_, w - 2 * pad);
-    drawText(L"Updates", D2D1::RectF(pad, y, w - pad, y + Theme::kSectionSize + 2.0f),
+    DrawText(rt, L"Updates", D2D1::RectF(pad, y, w - pad, y + Theme::kSectionSize + 2.0f),
              fmtSection_, brushSubtitle_);
     rt->DrawLine(D2D1::Point2F(pad, y + Theme::kSectionSize + 1.0f),
                  D2D1::Point2F(pad + updatesTitleW, y + Theme::kSectionSize + 1.0f),
@@ -1155,9 +1211,11 @@ void PopupWindow::DrawSettingsBody(ID2D1RenderTarget* rt, const VisualState& v, 
 
     const wchar_t* status = v.updateStatus[0] ? v.updateStatus
         : (v.updateAvailable ? L"Update available" : L"No update check yet");
-    drawText(status, D2D1::RectF(pad, y, w - pad, y + rowH), fmtLabel_, brushDim_);
+    DrawText(rt, status, D2D1::RectF(pad, y, w - pad, y + rowH), fmtLabel_, brushDim_);
     y += Theme::kLabelSize + Theme::kRowGap;
 
+    // "Check for updates" width depends on the busy ellipsis; only this button
+    // keeps a paint-time measure (the same cache is consulted either way).
     const wchar_t* checkLabel = v.updateBusy ? L"..." : L"Check for updates";
     float checkW = CachedLabelWidth(checkLabel, fmtPill_, w - 2 * pad) + 28.0f;
     if (checkW < 140.0f) {
@@ -1170,7 +1228,7 @@ void PopupWindow::DrawSettingsBody(ID2D1RenderTarget* rt, const VisualState& v, 
     checkUpdateBtn_ = D2D1::RectF(pad, y, pad + checkW, y + Theme::kRunButtonH);
     {
         const bool hot = (v.hover == PopupHit::SettingsCheckUpdate);
-        drawChunkyButton(checkUpdateBtn_, true, hot && !v.updateBusy, checkLabel);
+        DrawChunkyButton(rt, checkUpdateBtn_, true, hot && !v.updateBusy, checkLabel);
     }
 
     if (v.updateAvailable) {
@@ -1184,7 +1242,7 @@ void PopupWindow::DrawSettingsBody(ID2D1RenderTarget* rt, const VisualState& v, 
         } else {
             wcscpy_s(label, L"Download");
         }
-        drawChunkyButton(downloadUpdateBtn_, true, hot && !v.updateBusy, label);
+        DrawChunkyButton(rt, downloadUpdateBtn_, true, hot && !v.updateBusy, label);
     } else {
         downloadUpdateBtn_ = {};
     }
