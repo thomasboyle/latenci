@@ -192,10 +192,10 @@ private:
     float sectionSpeedTestW_ = 0.0f;
     float sectionDnsW_ = 0.0f;
     bool haveLabelMetrics_ = false;
-    // Label width cache: {text, fmt, maxW, measured width} quadruplets for the
-    // constant labels measured during DrawMainBody/DrawSettingsBody.
+    // Label width cache: {text, fmt, maxW, measured width}. Text is copied so
+    // mutable buffers (e.g. the link-speed label) remeasure when content changes.
     struct LabelWidthEntry {
-        const wchar_t* text;
+        wchar_t text[32];
         IDWriteTextFormat* fmt;
         float maxW;
         float width;

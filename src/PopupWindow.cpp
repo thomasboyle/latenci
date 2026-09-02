@@ -582,19 +582,22 @@ void PopupWindow::RefreshLabelMetrics() {
 }
 
 float PopupWindow::CachedLabelWidth(const wchar_t* text, IDWriteTextFormat* fmt, float maxW) {
+    if (!text) {
+        return 0.0f;
+    }
     for (int i = 0; i < labelWidthCount_; ++i) {
-        if (labelWidths_[i].fmt == fmt && labelWidths_[i].maxW == maxW) {
-            // All call sites pass string literals, so the pointer comparison is
-            // the common-case hit; wcscmp is the conservative fallback.
-            if (labelWidths_[i].text == text ||
-                wcscmp(labelWidths_[i].text, text) == 0) {
-                return labelWidths_[i].width;
-            }
+        if (labelWidths_[i].fmt == fmt && labelWidths_[i].maxW == maxW &&
+            wcscmp(labelWidths_[i].text, text) == 0) {
+            return labelWidths_[i].width;
         }
     }
     const float width = MeasureText(text, fmt, maxW);
     if (labelWidthCount_ < kLabelWidthCacheSize) {
-        labelWidths_[labelWidthCount_++] = {text, fmt, maxW, width};
+        LabelWidthEntry& e = labelWidths_[labelWidthCount_++];
+        wcsncpy_s(e.text, text, _TRUNCATE);
+        e.fmt = fmt;
+        e.maxW = maxW;
+        e.width = width;
     }
     return width;
 }
@@ -626,7 +629,16 @@ void PopupWindow::DrawChunkyButton(ID2D1RenderTarget* rt, const D2D1_RECT_F& rc,
         D2D1::Point2F(rc.left + rad, rc.bottom - 0.5f),
         D2D1::Point2F(rc.right - rad, rc.bottom - 0.5f),
         edge, bottomW);
-    DrawText(rt, label, rc, fmtPill_, brushInk_);
+    if (fmtPill_ && brushInk_ && label) {
+        const D2D1_RECT_F textRc = D2D1::RectF(
+            rc.left + Theme::kBtnBorderSide,
+            rc.top,
+            rc.right - Theme::kBtnBorderSide,
+            rc.bottom - bottomW);
+        rt->DrawTextW(label, static_cast<UINT32>(wcslen(label)), fmtPill_, textRc, brushInk_,
+                      D2D1_DRAW_TEXT_OPTIONS_NONE,
+                      DWRITE_MEASURING_MODE_NATURAL);
+    }
 }
 
 bool PopupWindow::EnsureDeviceResources() {
@@ -674,6 +686,7 @@ bool PopupWindow::EnsureDeviceResources() {
         if (fmtPill_) {
             fmtPill_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
             fmtPill_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            fmtPill_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         }
         if (fmtBadge_) {
             fmtBadge_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -1005,8 +1018,8 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
     }
 
     const float titleRightPad = (v.mode == ShowMode::Pinned)
-        ? (Theme::kCloseSize + Theme::kCloseHitPad * 2.0f + 100.0f)
-        : 90.0f;
+        ? (Theme::kCloseSize + Theme::kCloseHitPad * 2.0f + 110.0f)
+        : 110.0f;
     DrawText(rt, v.title,
              D2D1::RectF(pad + badge + 10.0f, pad - 1.0f, w - pad - titleRightPad, pad + 22.0f),
              fmtTitle_, brushInk_);
@@ -1034,10 +1047,8 @@ void PopupWindow::DrawPanel(ID2D1RenderTarget* rt) {
     }
 
     if (v.view == PanelView::Main) {
-        // linkSpeed changes only on adapter re-resolve, so this is cache-hit
-        // territory; the shared cache covers the 48 DIP minimum-fallback too.
         const float textW = CachedLabelWidth(v.linkSpeed, fmtPill_, 200.0f);
-        const float pillW = (textW < 1.0f ? 48.0f : textW) + Theme::kSpeedPillPadX * 2.0f;
+        const float pillW = (textW < 1.0f ? 48.0f : textW) + Theme::kSpeedPillPadX * 2.0f + 2.0f;
         const float px1 = speedPillRight;
         const float px0 = px1 - pillW;
         const float py0 = pad + (badge - Theme::kSpeedPillH) * 0.5f;
