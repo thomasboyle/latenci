@@ -706,8 +706,16 @@ bool PopupWindow::EnsureDeviceResources() {
             fmtBrand_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             fmtBrand_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         }
-        if (fmtLabel_) fmtLabel_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        if (fmtValue_) fmtValue_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+        if (fmtLabel_) {
+            fmtLabel_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            fmtLabel_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
+        if (fmtValue_) {
+            fmtValue_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            // Keep single-line values (especially dotted IPv4) from wrapping into the
+            // clipped second line of the short stat row.
+            fmtValue_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
         if (fmtSection_) fmtSection_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         if (fmtPill_) {
             fmtPill_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -1127,9 +1135,9 @@ void PopupWindow::DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, floa
         const float uy = y0 + Theme::kSectionSize + 1.0f;
         rt->DrawLine(D2D1::Point2F(x, uy), D2D1::Point2F(x + textW, uy), brushSubtitle_, 1.0f);
     };
-    // Column geometry is identical for the two stat rows; reuse one lambda.
+    // Column geometry is identical for the two-up stat rows; reuse one lambda.
     auto drawCol = [&](float x0, float x1, const wchar_t* label, const wchar_t* value) {
-        const float colW = (w - 2 * pad) * 0.5f - 8.0f;
+        const float colW = x1 - x0;
         const float rowH = Theme::kLabelSize + 4.0f;
         const float gap = Theme::kLabelFieldGap + 2.0f;
         float labelW = CachedLabelWidth(label, fmtLabel_, colW);
@@ -1154,7 +1162,16 @@ void PopupWindow::DrawMainBody(ID2D1RenderTarget* rt, const VisualState& v, floa
     drawStatPair(L"Ping", v.ping, L"Packet Loss", v.loss);
     drawStatPair(L"Receiving", v.recv, L"Sending", v.send);
     drawStatPair(L"Downloaded", v.downloaded, L"Uploaded", v.uploaded);
-    drawStatPair(L"IP Address", v.ipAddress, L"Frequency", v.frequency);
+    // Half-column leaves ~99 DIP for the value after "IP Address"; Monocraft
+    // needs up to ~140 DIP for 255.255.255.255. Bias this row toward the IP so
+    // typical IPv4 is not clipped (Frequency values stay short).
+    {
+        const float contentW = w - 2 * pad;
+        const float ipRight = pad + contentW * 0.58f + 4.0f;
+        drawCol(pad, ipRight, L"IP Address", v.ipAddress);
+        drawCol(ipRight + 8.0f, w - pad, L"Frequency", v.frequency);
+        y += Theme::kLabelSize + Theme::kRowGap;
+    }
 
     y += 2.0f;
     rt->DrawLine(D2D1::Point2F(pad, y), D2D1::Point2F(w - pad, y), brushHair_, 1.0f);
