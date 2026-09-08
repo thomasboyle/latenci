@@ -109,5 +109,5 @@ Stats paint is data-driven: the UI invalidates only on `WM_APP_STATS_UPDATED` (1
 ```text
 src/           Win32 application sources
 resources/     icon, manifest, RC, fonts
-CMakeLists.txt MSVC Release tuned for size (/O1, /LTCG, CFG, CET)
+CMakeLists.txt MSVC Release tuned for speed (/O2, /LTCG, CFG, CET)
 ```

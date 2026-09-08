@@ -232,4 +232,6 @@ private:
     SimpleHandler onDownloadUpdate_ = nullptr;
 
     PopupHit hoverHit_ = PopupHit::None;
+    // TrackMouseEvent only needs arming once per enter/leave cycle.
+    bool trackingMouse_ = false;
 };

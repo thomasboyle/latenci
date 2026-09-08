@@ -4,8 +4,8 @@ project(Latenci LANGUAGES CXX RC)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Drop the default /O2 /Ob2 so the size-oriented /O1 below is the only
-# optimization level passed (previously /O1 won only by argument ordering).
+# Drop the default /O2 /Ob2 so the speed-oriented /O2 below is the only
+# optimization level passed (previously duplicates fought by argument order).
 set(CMAKE_CXX_FLAGS_RELEASE "/DNDEBUG")
 
 add_executable(Latenci WIN32
@@ -44,7 +44,7 @@ target_compile_options(Latenci PRIVATE
     # Theme.h / NetworkMonitor.cpp / TrayIcon.cpp decode as the ANSI codepage.
     /utf-8
     /EHs-c-
-    $<$<CONFIG:Release>:/O1 /Gy /Gw /GL /GR- /guard:cf>
+    $<$<CONFIG:Release>:/O2 /Oi /Gy /Gw /GL /GR- /guard:cf>
 )
 
 target_link_libraries(Latenci PRIVATE

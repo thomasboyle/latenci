@@ -302,7 +302,14 @@ void PopupWindow::RebuildVisual(VisualState& v) {
     wcsncpy_s(v.frequency, snap_.frequency[0] ? snap_.frequency : L"—", _TRUNCATE);
     wcsncpy_s(v.updateVersion, updateVersion_, _TRUNCATE);
     wcsncpy_s(v.updateStatus, updateStatus_, _TRUNCATE);
-    swprintf_s(v.appVersion, L"v%hs", APP_VERSION);
+    // APP_VERSION is compile-time constant; format once for the process.
+    static wchar_t s_appVersion[32];
+    static bool s_appVersionReady = false;
+    if (!s_appVersionReady) {
+        swprintf_s(s_appVersion, L"v%hs", APP_VERSION);
+        s_appVersionReady = true;
+    }
+    wcsncpy_s(v.appVersion, s_appVersion, _TRUNCATE);
     v.mode = showMode_;
     v.view = panelView_;
     v.dns = dnsProvider_;
@@ -339,16 +346,35 @@ void PopupWindow::ForceRepaint() {
 
 void PopupWindow::SetSnapshot(const NetworkSnapshot& snap) {
     // Static labels only change when the monitor bumps staticGeneration.
-    if (snap.staticGeneration != snap_.staticGeneration) {
+    const bool staticChanged = snap.staticGeneration != snap_.staticGeneration;
+    if (staticChanged) {
         snap_.adapterValid = snap.adapterValid;
         snap_.ifIndex = snap.ifIndex;
         snap_.luid = snap.luid;
         snap_.interfaceGuid = snap.interfaceGuid;
-        wcsncpy_s(snap_.adapterName, snap.adapterName, _TRUNCATE);
-        wcsncpy_s(snap_.ipAddress, snap.ipAddress, _TRUNCATE);
-        wcsncpy_s(snap_.frequency, snap.frequency, _TRUNCATE);
-        wcsncpy_s(snap_.linkSpeedLabel, snap.linkSpeedLabel, _TRUNCATE);
+        memcpy(snap_.adapterName, snap.adapterName, sizeof(snap_.adapterName));
+        memcpy(snap_.ipAddress, snap.ipAddress, sizeof(snap_.ipAddress));
+        memcpy(snap_.frequency, snap.frequency, sizeof(snap_.frequency));
+        memcpy(snap_.linkSpeedLabel, snap.linkSpeedLabel, sizeof(snap_.linkSpeedLabel));
         snap_.staticGeneration = snap.staticGeneration;
+    }
+
+    // Bit-exact compare skips RebuildVisual/swprintf when the 1 Hz poll posted
+    // a snapshot that did not move any painted field (idle link, stable ping).
+    const bool dynamicChanged =
+        snap_.connected != snap.connected ||
+        snap_.pingMs != snap.pingMs ||
+        snap_.packetLossPct != snap.packetLossPct ||
+        snap_.recvBps != snap.recvBps ||
+        snap_.sendBps != snap.sendBps ||
+        snap_.downloadedBytes != snap.downloadedBytes ||
+        snap_.uploadedBytes != snap.uploadedBytes ||
+        snap_.downloadMbps != snap.downloadMbps ||
+        snap_.uploadMbps != snap.uploadMbps ||
+        snap_.speedTestRunning != snap.speedTestRunning;
+
+    if (!staticChanged && !dynamicChanged) {
+        return;
     }
 
     snap_.connected = snap.connected;
@@ -1310,24 +1336,41 @@ LRESULT PopupWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_MOUSEMOVE: {
-        TRACKMOUSEEVENT tme{sizeof(tme)};
-        tme.dwFlags = TME_LEAVE;
-        tme.hwndTrack = hwnd_;
-        TrackMouseEvent(&tme);
+        // Arm leave tracking once per cursor-enter; re-arming every move is a
+        // needless user32 round-trip on the hottest UI path.
+        if (!trackingMouse_) {
+            TRACKMOUSEEVENT tme{sizeof(tme)};
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd_;
+            TrackMouseEvent(&tme);
+            trackingMouse_ = true;
+        }
 
         const float x = ToDips(GET_X_LPARAM(lParam));
         const float y = ToDips(GET_Y_LPARAM(lParam));
         const PopupHit hit = HitTest(x, y);
         if (hit != hoverHit_) {
+            // Hover only affects chrome tint; skip RebuildVisual/swprintf.
             hoverHit_ = hit;
-            RefreshAndInvalidate();
+            visual_.hover = hit;
+            if (IsVisible()) {
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
         }
         return 0;
     }
 
     case WM_MOUSELEAVE:
-        hoverHit_ = PopupHit::None;
-        RefreshAndInvalidate();
+        trackingMouse_ = false;
+        if (hoverHit_ != PopupHit::None) {
+            hoverHit_ = PopupHit::None;
+            visual_.hover = PopupHit::None;
+            if (IsVisible()) {
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+        } else {
+            hoverHit_ = PopupHit::None;
+        }
         if (showMode_ == ShowMode::Hover && owner_) {
             // Owner decides: hide only if cursor is over neither tray nor panel.
             PostMessageW(owner_, WM_APP_HIDE_POPUP, 0, 0);
