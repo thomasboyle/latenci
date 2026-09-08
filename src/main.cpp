@@ -319,9 +319,12 @@ void StartSpeedTest(bool quick = false, bool quiet = false) {
 }
 
 void OnStatsUpdated() {
-    g_tray.SetConnected(g_monitor.Connected());
+    // One lock + merge for both tray and popup; avoids a second SharedGuard
+    // acquire on every 1 Hz tick while the flyout is open.
+    const NetworkSnapshot snap = g_monitor.GetSnapshot();
+    g_tray.SetConnected(snap.connected);
     if (g_popup.IsVisible()) {
-        g_popup.SetSnapshot(g_monitor.GetSnapshot());
+        g_popup.SetSnapshot(snap);
     }
 }
 

@@ -18,6 +18,15 @@ struct Guard {
     Guard& operator=(const Guard&) = delete;
 };
 
+// Shared (read) SRWLOCK guard for snapshot / identity getters that never mutate.
+struct SharedGuard {
+    PSRWLOCK lock;
+    explicit SharedGuard(PSRWLOCK l) : lock(l) { AcquireSRWLockShared(lock); }
+    ~SharedGuard() { ReleaseSRWLockShared(lock); }
+    SharedGuard(const SharedGuard&) = delete;
+    SharedGuard& operator=(const SharedGuard&) = delete;
+};
+
 // First GetAdaptersAddresses call allocates this much; grown on overflow only.
 constexpr ULONG kGaaInitialBytes = 16 * 1024;
 
@@ -253,12 +262,12 @@ void NetworkMonitor::SetLiveUpdates(bool enabled) {
 }
 
 NetworkSnapshot NetworkMonitor::GetSnapshot() const {
-    Guard guard(&lock_);
+    SharedGuard guard(&lock_);
     return MergeSnapshot(static_, dynamic_);
 }
 
 bool NetworkMonitor::Connected() const {
-    Guard guard(&lock_);
+    SharedGuard guard(&lock_);
     return dynamic_.connected;
 }
 
@@ -276,12 +285,12 @@ void NetworkMonitor::SetSpeedResults(double downloadMbps, double uploadMbps, boo
 }
 
 GUID NetworkMonitor::CachedGuid() const {
-    Guard guard(&lock_);
+    SharedGuard guard(&lock_);
     return static_.interfaceGuid;
 }
 
 bool NetworkMonitor::HasAdapter() const {
-    Guard guard(&lock_);
+    SharedGuard guard(&lock_);
     return static_.adapterValid;
 }
 
@@ -666,9 +675,12 @@ bool NetworkMonitor::PingOnce(double& outMs) const {
     if (icmp == INVALID_HANDLE_VALUE) {
         return false;
     }
-    BYTE sendData[32] = {};
+    // Payload content is irrelevant to RTT; keep a process-lifetime zero page
+    // rather than clearing 32 bytes on every echo.
+    static BYTE sendData[32] = {};
     constexpr DWORD replySize = sizeof(ICMP_ECHO_REPLY) + sizeof(sendData) + 16;
-    BYTE replyBuf[replySize] = {};
+    // IcmpSendEcho overwrites the reply buffer; skip the stack zeroing.
+    BYTE replyBuf[replySize];
     const DWORD replied = IcmpSendEcho(
         icmp,
         addr.S_un.S_addr,

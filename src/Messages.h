@@ -1,6 +1,7 @@
 #pragma once
 #include "WinIncludes.h"
 #include <cstdint>
+#include <cstring>
 // Custom messages shared across modules
 inline constexpr UINT WM_APP_STATS_UPDATED   = WM_APP + 1;
 inline constexpr UINT WM_APP_SPEED_DONE      = WM_APP + 2;
@@ -60,10 +61,12 @@ inline NetworkSnapshot MergeSnapshot(const NetworkStaticState& st,
     s.ifIndex = st.ifIndex;
     s.luid = st.luid;
     s.interfaceGuid = st.interfaceGuid;
-    wcsncpy_s(s.adapterName, st.adapterName, _TRUNCATE);
-    wcsncpy_s(s.ipAddress, st.ipAddress, _TRUNCATE);
-    wcsncpy_s(s.frequency, st.frequency, _TRUNCATE);
-    wcsncpy_s(s.linkSpeedLabel, st.linkSpeedLabel, _TRUNCATE);
+    // Fixed-size wchar buffers are always fully owned; memcpy avoids the
+    // per-call null scan / bounds dance of wcsncpy_s on the 1 Hz path.
+    memcpy(s.adapterName, st.adapterName, sizeof(s.adapterName));
+    memcpy(s.ipAddress, st.ipAddress, sizeof(s.ipAddress));
+    memcpy(s.frequency, st.frequency, sizeof(s.frequency));
+    memcpy(s.linkSpeedLabel, st.linkSpeedLabel, sizeof(s.linkSpeedLabel));
     s.staticGeneration = st.generation;
     s.pingMs = dyn.pingMs;
     s.packetLossPct = dyn.packetLossPct;
